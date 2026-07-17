@@ -54,7 +54,8 @@ class LauncherTests(unittest.TestCase):
                 }
             )
         self.assertIn("-i", command)
-        self.assertIn("BatchMode=yes", command)
+        # Serveo needs keyboard-interactive even with a registered key.
+        self.assertNotIn("BatchMode=yes", command)
         self.assertIn("IdentitiesOnly=yes", command)
         self.assertIn("my-notion-mcp:80:127.0.0.1:8765", command)
 

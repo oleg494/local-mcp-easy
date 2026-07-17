@@ -1,8 +1,13 @@
 # Changelog
 
+## 1.3.1 — 2026-07-17
+
+- Fixed: removed `BatchMode=yes` from the SSH command. Serveo completes auth via keyboard-interactive with an empty challenge even for registered keys (the key only authorizes the reserved hostname), so BatchMode broke both temporary and stable tunnels with `Permission denied`. Verified live.
+- Dead server/tunnel processes are no longer "stopped" on shutdown, removing a false "Refusing to stop PID" warning after PID reuse.
+
 ## 1.3.0 — 2026-07-17
 
-- SSH tunnel uses `BatchMode=yes` in stable mode: a passphrase-protected or wrong key fails immediately with a clear error instead of hanging silently. Temporary mode stays interactive-capable (Serveo anonymous auth needs it).
+- SSH tunnel briefly used `BatchMode=yes` — reverted in 1.3.1, see above.
 - Startup now polls the public `https://.../health` endpoint and reports success only after the tunnel actually serves traffic.
 - Tunnel errors now print the last lines of `tunnel.log` directly in the console.
 - `write_file` and `edit_file` write atomically (temp file + replace) to survive crashes and OneDrive sync races.

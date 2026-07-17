@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 APP_NAME = "NotionMcpEasy"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -342,12 +342,11 @@ def build_tunnel_command(config: dict) -> list[str]:
         key_path = Path(str(config.get("ssh_key", ""))).expanduser().resolve()
         if not key_path.is_file():
             raise RuntimeError(f"Serveo private SSH key not found: {key_path}")
-        # BatchMode only in stable mode: a bad/passphrase key fails fast instead
-        # of hanging. Temporary mode must stay interactive-capable — Serveo
-        # anonymous auth uses keyboard-interactive, which BatchMode rejects.
-        command.extend(
-            ["-o", "BatchMode=yes", "-i", str(key_path), "-o", "IdentitiesOnly=yes"]
-        )
+        # No BatchMode here: Serveo finishes auth via keyboard-interactive with
+        # an empty challenge even for registered keys (the key only authorizes
+        # the reserved hostname). BatchMode disables keyboard-interactive and
+        # breaks auth entirely — verified live on 2026-07-17.
+        command.extend(["-i", str(key_path), "-o", "IdentitiesOnly=yes"])
         remote = f"{hostname}:80:127.0.0.1:{port}"
     else:
         remote = f"80:127.0.0.1:{port}"
