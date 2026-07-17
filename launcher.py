@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 APP_NAME = "NotionMcpEasy"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -245,10 +245,16 @@ def tunnel_error(message: str) -> RuntimeError:
 
 
 def public_health_ok(
-    url: str, token: str, attempts: int = 10, delay: float = 2.0
+    url: str,
+    token: str,
+    attempts: int = 10,
+    delay: float = 2.0,
+    process: subprocess.Popen | None = None,
 ) -> bool:
     """Poll the public /health endpoint until the tunnel actually serves traffic."""
     for attempt in range(attempts):
+        if process is not None and process.poll() is not None:
+            return False
         request = urllib.request.Request(
             url.rstrip("/") + "/health",
             headers={"Authorization": f"Bearer {token}"},
@@ -479,7 +485,7 @@ def run() -> int:
         server, server_log = start_server(config)
         tunnel, lines = start_tunnel(config)
         url = resolve_tunnel_url(config, tunnel, lines)
-        if not public_health_ok(url, config["token"]):
+        if not public_health_ok(url, config["token"], process=tunnel):
             raise tunnel_error(f"Public health check failed: {url}/health did not answer")
         publish_connection(config, url, server.pid, tunnel.pid)
 
@@ -493,12 +499,13 @@ def run() -> int:
                 time.sleep(3)
                 tunnel, lines = start_tunnel(config)
                 url = resolve_tunnel_url(config, tunnel, lines)
-                if not public_health_ok(url, config["token"]):
-                    print(f"WARNING: {url}/health is not answering yet; will keep the tunnel running.")
+                healthy = public_health_ok(url, config["token"], process=tunnel)
                 publish_connection(config, url, server.pid, tunnel.pid)
-                if config.get("serveo_hostname"):
+                if not healthy:
+                    print(f"WARNING: {url}/health is not answering yet; keeping the tunnel up and retrying on next disconnect.")
+                elif config.get("serveo_hostname"):
                     print("Stable Serveo tunnel restored with the same URL.")
-                else:
+                if not config.get("serveo_hostname"):
                     print("IMPORTANT: the tunnel URL changed. Update the Custom MCP URL in Notion.")
             time.sleep(1)
     except KeyboardInterrupt:

@@ -50,6 +50,8 @@ class ServerSmokeTests(unittest.TestCase):
                 "MCP_BASE_DIR": str(PROJECT),
                 "MCP_PORT": str(port),
                 "MCP_ALLOW_COMMANDS": "0",
+                # Do not inherit a stable hostname from an active MCP session.
+                "MCP_SERVEO_HOSTNAME": "",
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )

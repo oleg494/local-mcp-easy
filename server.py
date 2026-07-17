@@ -7,6 +7,7 @@ import fnmatch
 import hmac
 import os
 import shutil
+import tempfile
 from itertools import islice
 from pathlib import Path
 
@@ -74,13 +75,20 @@ def _text_file(path: Path) -> None:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Write via temp file + replace so a crash or sync never leaves a partial file."""
-    temp = path.with_name(path.name + ".mcp-tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temp.replace(path)
+    """Write via unique temp file + replace: crash-safe and safe for parallel calls."""
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".mcp-tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
 
 
 async def _kill_tree(proc: asyncio.subprocess.Process) -> None:

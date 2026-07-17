@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2 — 2026-07-17
+
+- Atomic writes now use a unique temp file per call (`tempfile.mkstemp`): parallel `write_file`/`edit_file` calls on the same file no longer race on a shared temp name; temp files are cleaned up on failure.
+- Tests no longer inherit `MCP_SERVEO_HOSTNAME` from an active MCP session — the suite is reproducible regardless of where it runs.
+- Public health polling stops early if the SSH process dies instead of polling to timeout.
+- Reconnect no longer claims the stable tunnel is restored when its health check has not passed yet.
+
 ## 1.3.1 — 2026-07-17
 
 - Fixed: removed `BatchMode=yes` from the SSH command. Serveo completes auth via keyboard-interactive with an empty challenge even for registered keys (the key only authorizes the reserved hostname), so BatchMode broke both temporary and stable tunnels with `Permission denied`. Verified live.

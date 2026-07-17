@@ -9,6 +9,8 @@ sys.path.insert(0, str(PROJECT))
 os.environ["MCP_TOKEN"] = "unit-test-token"
 os.environ["MCP_BASE_DIR"] = str(PROJECT)
 os.environ["MCP_ALLOW_COMMANDS"] = "0"
+# Tests may run inside an active MCP session; do not inherit its stable hostname.
+os.environ["MCP_SERVEO_HOSTNAME"] = ""
 
 import server
 
