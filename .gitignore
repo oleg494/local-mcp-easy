@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.zip
+runtime.json
+connection.txt
