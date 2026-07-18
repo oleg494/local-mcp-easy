@@ -9,6 +9,7 @@
 - Repo context now stores persisted local policy in `agent-repo-config.local.json`, including configured/disabled state, last detected origin, branch, fork metadata, and explicit commit branch policy.
 - MCP now refuses git whenever the detected `remote.origin.url` no longer matches the saved local binding after restart, and blocks commit/push/merge/rebase outside the configured branch target.
 - Added tests for repo bootstrap, disable mode, origin mismatch, and URL normalization.
+- Release archives are now built into a local `release/` folder inside the project; that folder is excluded from Git and from the archive contents themselves.
 
 ## 1.3.5 — 2026-07-18
 

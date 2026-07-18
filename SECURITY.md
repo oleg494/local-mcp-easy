@@ -16,8 +16,8 @@ Serveo is a third-party SSH tunnel. The public URL and Bearer token must be trea
 
 ## Secret handling
 
-Configuration is stored in `%LOCALAPPDATA%\NotionMcpEasy`, not in the project folder or release archive. Large temporary MCP outputs are stored in `temp/` next to `server.py`, not inside the selected workspace. The local git binding file `agent-repo-config.local.json` stays in the project root and is intentionally excluded from release archives and normal Git sync. This file records whether git is configured, rebound, or explicitly disabled for the folder, plus the chosen commit-branch policy, so MCP can safely recover after a restart. Never post `connection.txt`, `config.json`, the tunnel URL, the token, or `@temp/...` output files in a public chat.
+Configuration is stored in `%LOCALAPPDATA%\NotionMcpEasy`, not in the project folder or release archive. Large temporary MCP outputs are stored in `temp/` next to `server.py`, not inside the selected workspace. Release ZIP files are built into `release/` inside the project, and that folder is intentionally excluded from both Git sync and the release archive itself. The local git binding file `agent-repo-config.local.json` stays in the project root and is intentionally excluded from release archives and normal Git sync. This file records whether git is configured, rebound, or explicitly disabled for the folder, plus the chosen commit-branch policy, so MCP can safely recover after a restart. Never post `connection.txt`, `config.json`, the tunnel URL, the token, or `@temp/...` output files in a public chat.
 
 ## Reporting
 
-When sharing a security report, redact tokens, cookies, account files and private paths. Do not attach `.venv`, logs, LocalAppData configuration, runtime files, or the MCP `temp/` directory to a release archive.
+When sharing a security report, redact tokens, cookies, account files and private paths. Do not attach `.venv`, logs, LocalAppData configuration, runtime files, the MCP `temp/` directory, or the local `release/` directory contents back into another release archive.

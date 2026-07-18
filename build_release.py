@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-OUTPUT = ROOT.parent / f"notion-mcp-easy-{VERSION}.zip"
-EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "temp"}
+RELEASE_DIR = ROOT / "release"
+OUTPUT = RELEASE_DIR / f"notion-mcp-easy-{VERSION}.zip"
+EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "temp", "release"}
 EXCLUDED_SUFFIXES = {".log", ".pyc", ".zip"}
 EXCLUDED_FILES = {"connection.txt", "runtime.json", "config.json", "agent-repo-instructions.local.md", "agent-repo-config.local.json"}
 
@@ -24,12 +23,14 @@ def included_files():
 
 
 def main() -> int:
+    RELEASE_DIR.mkdir(exist_ok=True)
     OUTPUT.unlink(missing_ok=True)
     files = list(included_files())
     with zipfile.ZipFile(OUTPUT, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for source, destination in files:
             archive.write(source, destination)
     print(f"Created: {OUTPUT}")
+    print(f"Release dir: {RELEASE_DIR}")
     print(f"Files: {len(files)}")
     print(f"Size: {OUTPUT.stat().st_size:,} bytes")
     return 0
