@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.zip
+runtime.json
+connection.txt
+temp/
+agent-repo-instructions.local.md
+agent-repo-config.local.json
