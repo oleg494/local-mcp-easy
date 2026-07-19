@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1 — 2026-07-19
+
+- Tightened git policy so ordinary mutating git commands such as `reset`, `checkout -B`, `tag`, `config`, and `remote set-url` no longer bypass the repo guard-layer.
+- Added an explicit consent-layer for git setup changes: defaults now require confirmation, and changing an existing repo binding requires `confirm_reconfigure`.
+- `workspace_info()` now shows a compact root-repo plus nested-repo overview instead of only a single-layer summary.
+- Fixed repo-context handling for nested repositories and extended the repo-context regression coverage.
+- Added tests for consent-layer flows, nested repo summaries, mutating git command blocking, large-file / long-line safety, and `git -C` target validation.
+
 ## 1.4.0 — 2026-07-18
 
 - Added a full git setup-flow for MCP workspaces instead of a guard-only model.

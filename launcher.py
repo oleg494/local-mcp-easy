@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 APP_NAME = "NotionMcpEasy"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"

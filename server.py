@@ -154,8 +154,13 @@ def _tool_output_path(prefix: str) -> Path:
     return _temp_dir() / f"{safe_prefix}-{stamp}.txt"
 
 
-def _repo_context_path() -> Path:
-    return _path(REPO_CONTEXT_FILE)
+def _repo_context_path(cwd: Path | None = None, git_args: list[str] | None = None) -> Path:
+    scope_dir = BASE_DIR if cwd is None else cwd
+    if cwd is not None:
+        detected = _detect_git_repo(cwd, git_args)
+        if detected["repo_present"]:
+            scope_dir = Path(str(detected["top_level"]))
+    return safe_path(scope_dir, REPO_CONTEXT_FILE)
 
 
 def _normalize_repo_url(value: str) -> str:
@@ -304,8 +309,8 @@ def _coerce_repo_context(raw: dict[str, object], config_path: Path) -> dict[str,
     }
 
 
-def _load_repo_context() -> dict[str, object] | None:
-    config_path = _repo_context_path()
+def _load_repo_context(cwd: Path | None = None, git_args: list[str] | None = None) -> dict[str, object] | None:
+    config_path = _repo_context_path(cwd, git_args)
     if not config_path.is_file():
         return None
 
@@ -332,6 +337,8 @@ def _save_repo_context(
     disabled_reason: str = "",
     last_detected_origin: str = "",
     last_detected_branch: str = "",
+    cwd: Path | None = None,
+    git_args: list[str] | None = None,
 ) -> Path:
     if status not in {"configured", "disabled"}:
         raise ValueError("status must be 'configured' or 'disabled'")
@@ -340,7 +347,7 @@ def _save_repo_context(
 
     existing: dict[str, object] | None
     try:
-        existing = _load_repo_context()
+        existing = _load_repo_context(cwd, git_args)
     except ValueError:
         existing = None
 
@@ -387,7 +394,7 @@ def _save_repo_context(
         "last_checked_at": now,
     }
 
-    config_path = _repo_context_path()
+    config_path = _repo_context_path(cwd, git_args)
     _atomic_write_text(config_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return config_path
 
@@ -409,12 +416,45 @@ def _require_git_executable() -> str:
     return executable
 
 
-def _run_git_query(cwd: Path, *args: str, timeout: int = 5) -> subprocess.CompletedProcess[str] | None:
+def _split_git_global_args(git_args: list[str]) -> tuple[list[str], str]:
+    options_with_value = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+    prefix: list[str] = []
+    skip_next = False
+    subcommand = ""
+
+    for arg in git_args:
+        if skip_next:
+            prefix.append(arg)
+            skip_next = False
+            continue
+        if arg in options_with_value:
+            prefix.append(arg)
+            skip_next = True
+            continue
+        if any(arg.startswith(f"{option}=") for option in options_with_value if option.startswith("--")):
+            prefix.append(arg)
+            continue
+        if arg.startswith("-") and not subcommand:
+            prefix.append(arg)
+            continue
+        if not subcommand:
+            subcommand = arg.lower()
+            break
+
+    return prefix, subcommand
+
+
+def _run_git_query(
+    cwd: Path,
+    *args: str,
+    timeout: int = 5,
+    git_prefix: list[str] | None = None,
+) -> subprocess.CompletedProcess[str] | None:
     executable = _git_executable()
     if not executable:
         return None
     return subprocess.run(
-        [executable, *args],
+        [executable, *(git_prefix or []), *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -443,7 +483,7 @@ def _run_git_checked(cwd: Path, *args: str, timeout: int = 15) -> subprocess.Com
     return result
 
 
-def _detect_git_repo(cwd: Path) -> dict[str, object]:
+def _detect_git_repo(cwd: Path, git_args: list[str] | None = None) -> dict[str, object]:
     executable = _git_executable()
     result: dict[str, object] = {
         "git_installed": bool(executable),
@@ -459,17 +499,18 @@ def _detect_git_repo(cwd: Path) -> dict[str, object]:
     if not executable:
         return result
 
-    top_level = _run_git_query(cwd, "rev-parse", "--show-toplevel")
+    git_prefix, _ = _split_git_global_args(list(git_args or []))
+    top_level = _run_git_query(cwd, "rev-parse", "--show-toplevel", git_prefix=git_prefix)
     if top_level is None or top_level.returncode != 0:
         return result
 
     root = top_level.stdout.strip()
-    branch = _run_git_query(cwd, "branch", "--show-current")
-    remotes_query = _run_git_query(cwd, "remote")
+    branch = _run_git_query(cwd, "branch", "--show-current", git_prefix=git_prefix)
+    remotes_query = _run_git_query(cwd, "remote", git_prefix=git_prefix)
     remotes: dict[str, str] = {}
     if remotes_query is not None and remotes_query.returncode == 0:
         for remote_name in [line.strip() for line in remotes_query.stdout.splitlines() if line.strip()]:
-            url_query = _run_git_query(cwd, "config", "--get", f"remote.{remote_name}.url")
+            url_query = _run_git_query(cwd, "config", "--get", f"remote.{remote_name}.url", git_prefix=git_prefix)
             if url_query is not None and url_query.returncode == 0:
                 remotes[remote_name] = url_query.stdout.strip()
 
@@ -514,16 +555,16 @@ def _inspect_git_repository_text(cwd: Path) -> str:
     return "\n".join(lines)
 
 
-def _repo_context_state(cwd: Path) -> tuple[str, dict[str, object] | None, dict[str, object], list[str]]:
+def _repo_context_state(cwd: Path, git_args: list[str] | None = None) -> tuple[str, dict[str, object] | None, dict[str, object], list[str]]:
     lines: list[str] = []
     config: dict[str, object] | None
 
     try:
-        config = _load_repo_context()
+        config = _load_repo_context(cwd, git_args)
     except ValueError as exc:
         config = None
         lines.append(f"repo context status: invalid ({exc})")
-        detected = _detect_git_repo(cwd)
+        detected = _detect_git_repo(cwd, git_args)
         lines.append("git policy: blocked")
         lines.append("next step: recreate the local repo context with setup_git_context(...) or configure_repo_context(...)")
         return "invalid_context", config, detected, lines
@@ -549,7 +590,7 @@ def _repo_context_state(cwd: Path) -> tuple[str, dict[str, object] | None, dict[
         if config["disabled_reason"]:
             lines.append(f"disabled reason: {config['disabled_reason']}")
 
-    detected = _detect_git_repo(cwd)
+    detected = _detect_git_repo(cwd, git_args)
     if not detected["git_installed"]:
         lines.append("git detected: not installed")
         lines.append("git policy: blocked")
@@ -612,12 +653,171 @@ def _repo_context_state(cwd: Path) -> tuple[str, dict[str, object] | None, dict[
     return "repo_present_bound_ok", config, detected, lines
 
 
-def _repo_context_summary(cwd: Path) -> str:
-    _, _, _, lines = _repo_context_state(cwd)
+def _repo_context_summary(cwd: Path, git_args: list[str] | None = None) -> str:
+    _, _, _, lines = _repo_context_state(cwd, git_args)
     return "\n".join(lines)
 
 
-def _ensure_remote_url(cwd: Path, remote_name: str, url: str, force_update: bool) -> str:
+def _build_repo_context_desired(
+    *,
+    status: str,
+    repository_url: str,
+    is_fork: bool | None,
+    upstream_url: str,
+    default_branch: str,
+    branch_mode: str,
+    commit_branch: str,
+    git_enabled: bool,
+    disabled_reason: str,
+) -> dict[str, object]:
+    repository_url = repository_url.strip()
+    upstream_url = upstream_url.strip()
+    default_branch = default_branch.strip()
+    commit_branch = commit_branch.strip()
+    disabled_reason = disabled_reason.strip()
+    return {
+        "status": status,
+        "git_enabled": git_enabled,
+        "repository_url": repository_url,
+        "normalized_repository_url": _normalize_repo_url(repository_url) if repository_url else "",
+        "is_fork": is_fork,
+        "upstream_url": upstream_url,
+        "normalized_upstream_url": _normalize_repo_url(upstream_url) if upstream_url else "",
+        "default_branch": default_branch,
+        "branch_mode": branch_mode,
+        "commit_branch": commit_branch,
+        "disabled_reason": disabled_reason,
+    }
+
+
+def _format_policy_value(value: object) -> str:
+    if value is None or value == "":
+        return "(empty)"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _repo_context_change_descriptions(
+    existing: dict[str, object], desired: dict[str, object]
+) -> list[str]:
+    comparisons = [
+        ("status", "status"),
+        ("git_enabled", "git enabled"),
+        ("normalized_repository_url", "repository URL"),
+        ("is_fork", "fork setting"),
+        ("normalized_upstream_url", "upstream URL"),
+        ("default_branch", "default branch"),
+        ("branch_mode", "branch mode"),
+        ("commit_branch", "commit branch"),
+        ("disabled_reason", "disabled reason"),
+    ]
+    changes: list[str] = []
+    for key, label in comparisons:
+        if existing.get(key) != desired.get(key):
+            changes.append(
+                f"{label}: {_format_policy_value(existing.get(key))} -> {_format_policy_value(desired.get(key))}"
+            )
+    return changes
+
+
+def _require_repo_context_confirmation(
+    existing: dict[str, object] | None,
+    desired: dict[str, object],
+    confirm_reconfigure: bool,
+) -> None:
+    if existing is None:
+        return
+    changes = _repo_context_change_descriptions(existing, desired)
+    if changes and not confirm_reconfigure:
+        raise ValueError(
+            "Repo context already exists for this repository. Any change requires explicit confirmation. "
+            "Rerun with confirm_reconfigure=true. Proposed changes:\n- "
+            + "\n- ".join(changes)
+        )
+
+
+def _require_explicit_defaults(defaults_used: list[str], confirm_defaults: bool) -> None:
+    if defaults_used and not confirm_defaults:
+        raise ValueError(
+            "Some settings are not explicitly set. Pass explicit values or rerun with "
+            "confirm_defaults=true to accept these defaults: "
+            + ", ".join(defaults_used)
+        )
+
+
+def _repo_state_label(state: str) -> str:
+    return {
+        "repo_present_bound_ok": "ok",
+        "setup_required_no_repo": "no git repo",
+        "setup_required_existing_repo": "missing context",
+        "repo_present_bound_mismatch": "origin mismatch",
+        "repo_present_no_origin": "origin missing",
+        "branch_policy_missing": "branch policy missing",
+        "disabled": "disabled",
+        "repo_missing": "repo missing",
+        "git_unavailable": "git unavailable",
+        "invalid_context": "invalid context",
+    }.get(state, state.replace("_", " "))
+
+
+def _discover_workspace_git_roots(base_dir: Path, limit: int = 25) -> list[Path]:
+    roots: list[Path] = []
+    for current, dirs, files in os.walk(base_dir):
+        current_path = Path(current)
+        has_git = ".git" in dirs or ".git" in files
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if d != ".git" and d not in EXCLUDES and not d.startswith(".")
+        )
+        if has_git:
+            safe_path(base_dir, current_path)
+            roots.append(current_path.resolve())
+            if len(roots) >= limit:
+                break
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for repo_root in sorted(roots, key=lambda p: (len(p.relative_to(base_dir).parts), str(p).lower())):
+        if repo_root not in seen:
+            seen.add(repo_root)
+            ordered.append(repo_root)
+    return ordered
+
+
+def _format_workspace_repo_line(repo_root: Path) -> str:
+    state, config, detected, _ = _repo_context_state(repo_root)
+    rel = "." if repo_root == BASE_DIR else str(repo_root.relative_to(BASE_DIR))
+    current_branch = str(detected.get("branch", "")).strip() or "(detached or unknown)"
+    target_branch = _target_commit_branch(config) if config else ""
+    parts = [_repo_state_label(state), f"current {current_branch}"]
+    if target_branch:
+        parts.append(f"target {target_branch}")
+    return f"{rel} - " + " | ".join(parts)
+
+
+def _workspace_repo_overview(base_dir: Path = BASE_DIR, max_nested: int = 10) -> str:
+    roots = _discover_workspace_git_roots(base_dir)
+    if not roots:
+        return "git repos in workspace: none"
+
+    lines = [f"git repos in workspace: {len(roots)}"]
+    if base_dir in roots:
+        lines.append(f"root repo: {_format_workspace_repo_line(base_dir)}")
+    else:
+        lines.append("root repo: none")
+
+    nested = [repo_root for repo_root in roots if repo_root != base_dir]
+    lines.append(f"nested repos: {len(nested)}")
+    for repo_root in nested[:max_nested]:
+        lines.append(f"- {_format_workspace_repo_line(repo_root)}")
+    if len(nested) > max_nested:
+        lines.append(f"... and {len(nested) - max_nested} more nested repos")
+    lines.append("Use repo_context_status(cwd='...') for full details on a specific repo.")
+    return "\n".join(lines)
+
+
+def _ensure_remote_url(cwd: Path, remote_name: str, url: str, force_update: bool, confirm_reconfigure: bool = False) -> str:
     current_query = _run_git_query(cwd, "config", "--get", f"remote.{remote_name}.url")
     current_url = current_query.stdout.strip() if current_query is not None and current_query.returncode == 0 else ""
     current_normalized = _normalize_repo_url(current_url) if current_url else ""
@@ -632,6 +832,12 @@ def _ensure_remote_url(cwd: Path, remote_name: str, url: str, force_update: bool
         raise ValueError(
             f"remote.{remote_name}.url already points to {current_url}. "
             f"Use force_origin_update=true to change it to {url}."
+        )
+    if not confirm_reconfigure:
+        raise ValueError(
+            f"remote.{remote_name}.url already points to {current_url}. "
+            "Changing an existing git remote requires explicit confirmation. "
+            "Rerun with confirm_reconfigure=true as well."
         )
     _run_git_checked(cwd, "remote", "set-url", remote_name, url)
     return f"updated remote {remote_name}"
@@ -650,6 +856,8 @@ def _setup_git_context_sync(
     disable_reason: str = "",
     force_origin_update: bool = False,
     set_upstream_remote: bool = False,
+    confirm_defaults: bool = False,
+    confirm_reconfigure: bool = False,
 ) -> str:
     mode = mode.strip()
     branch_mode = branch_mode.strip() or "default_branch"
@@ -658,22 +866,29 @@ def _setup_git_context_sync(
     if branch_mode not in {"default_branch", "specified_branch"}:
         raise ValueError("branch_mode must be 'default_branch' or 'specified_branch'")
 
-    if mode == "disable_git":
+    try:
+        existing = _load_repo_context(cwd)
+    except ValueError:
         existing = None
-        try:
-            existing = _load_repo_context()
-        except ValueError:
-            existing = None
-        detected = _detect_git_repo(cwd)
+    detected_before = _detect_git_repo(cwd)
+    if not detected_before["git_installed"]:
+        raise ValueError("Git is not installed or not on PATH.")
+
+    if mode == "disable_git":
         repository_url = (
-            str(existing["repository_url"]) if existing and existing["repository_url"] else str(detected["origin_url"])
-        )
+            str(existing["repository_url"]) if existing and existing["repository_url"] else str(detected_before["origin_url"])
+        ).strip()
         is_fork = existing["is_fork"] if existing else None
         upstream_url = str(existing["upstream_url"]) if existing else ""
         default_branch = str(existing["default_branch"]) if existing else ""
         branch_mode = str(existing["branch_mode"]) if existing and existing.get("branch_mode") else "default_branch"
         commit_branch = str(existing["commit_branch"]) if existing else ""
-        config_path = _save_repo_context(
+        defaults_used: list[str] = []
+        if not disable_reason.strip():
+            disable_reason = "user choice"
+            defaults_used.append("disable_reason='user choice'")
+        _require_explicit_defaults(defaults_used, confirm_defaults)
+        desired = _build_repo_context_desired(
             status="disabled",
             repository_url=repository_url,
             is_fork=is_fork if isinstance(is_fork, bool) else None,
@@ -682,9 +897,22 @@ def _setup_git_context_sync(
             branch_mode=branch_mode,
             commit_branch=commit_branch,
             git_enabled=False,
-            disabled_reason=disable_reason or "user choice",
-            last_detected_origin=str(detected["origin_url"]),
-            last_detected_branch=str(detected["branch"]),
+            disabled_reason=disable_reason,
+        )
+        _require_repo_context_confirmation(existing, desired, confirm_reconfigure)
+        config_path = _save_repo_context(
+            cwd=cwd,
+            status="disabled",
+            repository_url=repository_url,
+            is_fork=is_fork if isinstance(is_fork, bool) else None,
+            upstream_url=upstream_url,
+            default_branch=default_branch,
+            branch_mode=branch_mode,
+            commit_branch=commit_branch,
+            git_enabled=False,
+            disabled_reason=disable_reason,
+            last_detected_origin=str(detected_before["origin_url"]),
+            last_detected_branch=str(detected_before["branch"]),
         )
         summary = _repo_context_summary(cwd)
         return f"Saved disabled git policy to {config_path.relative_to(BASE_DIR)}\n\n{summary}"
@@ -692,16 +920,45 @@ def _setup_git_context_sync(
     repository_url = repository_url.strip()
     if not repository_url:
         raise ValueError("repository_url is required for this setup mode")
+    if not fork_status.strip():
+        raise ValueError("fork_status must be explicitly set to 'fork' or 'not_fork'")
     is_fork = _parse_fork_status(fork_status)
     upstream_url = upstream_url.strip()
     default_branch = default_branch.strip()
     commit_branch = commit_branch.strip()
+    defaults_used: list[str] = []
+
     if branch_mode == "specified_branch" and not commit_branch:
         raise ValueError("commit_branch is required when branch_mode='specified_branch'")
 
-    detected_before = _detect_git_repo(cwd)
-    if not detected_before["git_installed"]:
-        raise ValueError("Git is not installed or not on PATH.")
+    if branch_mode == "default_branch" and not default_branch:
+        if mode == "init_new_repo" or (mode == "attach_to_remote" and not detected_before["repo_present"]):
+            default_branch = "main"
+            defaults_used.append("default_branch='main'")
+        elif existing and existing.get("default_branch"):
+            default_branch = str(existing["default_branch"]).strip()
+        elif detected_before["branch"]:
+            default_branch = str(detected_before["branch"]).strip()
+            defaults_used.append(f"default_branch='{default_branch}'")
+        else:
+            raise ValueError(
+                "default_branch is not set. Pass it explicitly, or rerun with confirm_defaults=true "
+                "only when a safe default is available."
+            )
+    _require_explicit_defaults(defaults_used, confirm_defaults)
+
+    desired = _build_repo_context_desired(
+        status="configured",
+        repository_url=repository_url,
+        is_fork=is_fork,
+        upstream_url=upstream_url,
+        default_branch=default_branch,
+        branch_mode=branch_mode,
+        commit_branch=commit_branch,
+        git_enabled=True,
+        disabled_reason="",
+    )
+    _require_repo_context_confirmation(existing, desired, confirm_reconfigure)
 
     actions: list[str] = []
     work_root = cwd
@@ -730,9 +987,9 @@ def _setup_git_context_sync(
             raise ValueError("No git repository exists here yet. Ask the user whether to init_new_repo, attach_to_remote, or disable_git.")
         work_root = Path(str(detected_before["top_level"]))
 
-    actions.append(_ensure_remote_url(work_root, "origin", repository_url, force_origin_update))
+    actions.append(_ensure_remote_url(work_root, "origin", repository_url, force_origin_update, confirm_reconfigure))
     if upstream_url and set_upstream_remote:
-        actions.append(_ensure_remote_url(work_root, "upstream", upstream_url, True))
+        actions.append(_ensure_remote_url(work_root, "upstream", upstream_url, True, confirm_reconfigure))
 
     detected_after = _detect_git_repo(work_root)
     final_branch = str(detected_after["branch"] or default_branch).strip()
@@ -741,6 +998,7 @@ def _setup_git_context_sync(
         raise ValueError("default_branch is required when branch_mode='default_branch'")
 
     config_path = _save_repo_context(
+        cwd=work_root,
         status="configured",
         repository_url=repository_url,
         is_fork=is_fork,
@@ -763,33 +1021,236 @@ def _setup_git_context_sync(
     )
 
 
-def _extract_git_subcommand(git_args: list[str]) -> str:
+def _split_git_command(git_args: list[str]) -> tuple[list[str], str, list[str]]:
     options_with_value = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+    prefix: list[str] = []
+    index = 0
+    while index < len(git_args):
+        arg = git_args[index]
+        if arg in options_with_value:
+            prefix.append(arg)
+            if index + 1 < len(git_args):
+                prefix.append(git_args[index + 1])
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in options_with_value if option.startswith("--")):
+            prefix.append(arg)
+            index += 1
+            continue
+        if arg.startswith("-"):
+            prefix.append(arg)
+            index += 1
+            continue
+        return prefix, arg.lower(), git_args[index + 1:]
+    return prefix, "", []
+
+
+def _command_positionals(args: list[str], options_with_value: set[str] | None = None) -> list[str]:
+    options_with_value = options_with_value or set()
+    positionals: list[str] = []
     skip_next = False
-    for arg in git_args:
+    passthrough = False
+    for arg in args:
+        if passthrough:
+            positionals.append(arg)
+            continue
         if skip_next:
             skip_next = False
+            continue
+        if arg == "--":
+            passthrough = True
             continue
         if arg in options_with_value:
             skip_next = True
             continue
+        if any(arg.startswith(f"{option}=") for option in options_with_value if option.startswith("--")):
+            continue
         if arg.startswith("-"):
             continue
-        return arg.lower()
+        positionals.append(arg)
+    return positionals
+
+
+def _allowed_remote_urls(config: dict[str, object]) -> set[str]:
+    urls = {
+        str(config.get("normalized_repository_url", "")).strip(),
+        str(config.get("normalized_upstream_url", "")).strip(),
+    }
+    return {url for url in urls if url}
+
+
+def _normalize_remote_candidate(remote_ref: str, detected: dict[str, object]) -> str:
+    remotes = detected.get("remotes", {})
+    if isinstance(remotes, dict) and remote_ref in remotes:
+        return _normalize_repo_url(str(remotes[remote_ref]))
+    if "://" in remote_ref or re.fullmatch(r"(?:[^@]+@)?[^:]+:.+", remote_ref):
+        return _normalize_repo_url(remote_ref)
     return ""
 
 
+def _ensure_remote_reference_allowed(
+    remote_ref: str,
+    config: dict[str, object],
+    detected: dict[str, object],
+    *,
+    context: str,
+) -> None:
+    if not remote_ref:
+        return
+    normalized = _normalize_remote_candidate(remote_ref, detected)
+    if not normalized:
+        raise ValueError(
+            f"Git is blocked because {context} must use a configured remote, but got {remote_ref}."
+        )
+    if normalized not in _allowed_remote_urls(config):
+        raise ValueError(
+            f"Git is blocked because {context} points to a remote outside the approved repo context: {remote_ref}."
+        )
+
+
+def _require_current_branch_matches(current_branch: str, target_branch: str) -> None:
+    if not current_branch:
+        raise ValueError(
+            f"Git is blocked because changes for this workspace must happen on {target_branch}, "
+            "but the repository is currently detached or the branch is unknown."
+        )
+    if current_branch != target_branch:
+        raise ValueError(
+            f"Git is blocked because this workspace is configured to work on {target_branch}, "
+            f"but the current branch is {current_branch}. Switch branches first or update the repo context."
+        )
+
+
+def _is_git_config_read_only(args: list[str]) -> bool:
+    mutating_flags = {"--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section"}
+    if any(flag in args for flag in mutating_flags):
+        return False
+    positionals = _command_positionals(args, {"-f", "--file", "--type", "--default", "--blob", "--fixed-value", "--url"})
+    return len(positionals) <= 1
+
+
+def _is_git_remote_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if args[0] in {"-v", "--verbose"}:
+        return True
+    return args[0] in {"show", "get-url"}
+
+
+def _remote_read_only_target(args: list[str]) -> str:
+    if not args or args[0] in {"-v", "--verbose"}:
+        return ""
+    if args[0] in {"show", "get-url"}:
+        positionals = _command_positionals(args[1:])
+        return positionals[0] if positionals else ""
+    return ""
+
+
+def _is_git_branch_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    mutating_flags = {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy", "--delete", "--set-upstream-to", "--unset-upstream", "--edit-description"}
+    if any(flag in args for flag in mutating_flags):
+        return False
+    positionals = _command_positionals(args, {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--column"})
+    return len(positionals) == 0
+
+
+def _is_git_tag_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    if any(flag in args for flag in {"-d", "--delete", "-f", "--force", "-a", "-s", "-u", "-m", "-F", "--cleanup", "--trailer"}):
+        return False
+    positionals = _command_positionals(args, {"-m", "-F", "-u", "--cleanup", "--trailer"})
+    return len(positionals) == 0 or any(flag in args for flag in {"-l", "--list"})
+
+
+def _checkout_target_branch(args: list[str]) -> str:
+    scan = args[: args.index("--")] if "--" in args else args
+    index = 0
+    while index < len(scan):
+        arg = scan[index]
+        if arg in {"-b", "-B", "--orphan"}:
+            return scan[index + 1] if index + 1 < len(scan) else ""
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return ""
+
+
+def _switch_target_branch(args: list[str]) -> str:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-c", "-C", "--orphan"}:
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return ""
+
+
+def _branch_target(args: list[str]) -> str:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy", "--delete", "--set-upstream-to"}:
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg.startswith("--set-upstream-to="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return ""
+
+
+def _push_remote_and_refspecs(args: list[str]) -> tuple[str, list[str]]:
+    positionals = _command_positionals(args, {"-u", "--set-upstream", "--repo", "--receive-pack", "--exec", "-o", "--push-option"})
+    if not positionals:
+        return "", []
+    return positionals[0], positionals[1:]
+
+
+def _pull_remote_and_branch(args: list[str]) -> tuple[str, str]:
+    positionals = _command_positionals(args, {"--rebase-merges", "--strategy", "--strategy-option"})
+    remote = positionals[0] if positionals else ""
+    branch = positionals[1] if len(positionals) > 1 else ""
+    return remote, branch
+
+
+def _fetch_remote(args: list[str]) -> str:
+    if "--all" in args:
+        return "__ALL__"
+    positionals = _command_positionals(args, {"--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--refmap", "--filter", "-o", "--server-option", "--upload-pack"})
+    return positionals[0] if positionals else ""
+
+
+def _refspec_target_branch(refspec: str, current_branch: str) -> str:
+    target = refspec
+    if ":" in refspec:
+        target = refspec.split(":", 1)[1]
+    target = target.lstrip("+")
+    if target in {"", "HEAD"}:
+        return current_branch
+    if target.startswith("refs/heads/"):
+        return target[len("refs/heads/") :]
+    return target
+
+
 def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None) -> None:
-    state, config, detected, lines = _repo_context_state(cwd)
+    git_args = list(git_args or [])
+    state, config, detected, lines = _repo_context_state(cwd, git_args)
     if state != "repo_present_bound_ok":
         raise ValueError("Git is blocked for this workspace.\n\n" + "\n".join(lines))
     if config is None:
         raise ValueError("Git is blocked because repo context data is unavailable.")
 
-    subcommand = _extract_git_subcommand(git_args or [])
-    branch_sensitive = {"commit", "push", "merge", "rebase", "cherry-pick", "revert", "am"}
-    if subcommand not in branch_sensitive:
-        return
+    _, subcommand, tail = _split_git_command(git_args)
+    if not subcommand:
+        raise ValueError("Git is blocked because the command could not be classified safely.")
 
     target_branch = _target_commit_branch(config)
     if not target_branch:
@@ -797,18 +1258,140 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
             "Git is blocked because commit branch policy is not fully configured. "
             "Run setup_git_context(...) and choose default_branch or commit_branch explicitly."
         )
-
     current_branch = str(detected.get("branch", "")).strip()
-    if not current_branch:
+
+    simple_read_only = {
+        "status",
+        "log",
+        "show",
+        "diff",
+        "rev-parse",
+        "describe",
+        "ls-files",
+        "ls-tree",
+        "cat-file",
+        "blame",
+        "grep",
+        "symbolic-ref",
+    }
+    if subcommand in simple_read_only:
+        return
+
+    if subcommand == "config":
+        if _is_git_config_read_only(tail):
+            return
         raise ValueError(
-            f"Git is blocked because commits for this workspace must happen on {target_branch}, "
-            "but the repository is currently detached or the branch is unknown."
+            "Git is blocked because mutating git config is not allowed through ordinary git commands. "
+            "Use setup_git_context(...) or configure_repo_context(...) only with explicit user confirmation."
         )
-    if current_branch != target_branch:
+
+    if subcommand == "remote":
+        if _is_git_remote_read_only(tail):
+            remote_target = _remote_read_only_target(tail)
+            _ensure_remote_reference_allowed(remote_target, config, detected, context="this remote lookup")
+            return
         raise ValueError(
-            f"Git is blocked because this workspace is configured to commit on {target_branch}, "
-            f"but the current branch is {current_branch}. Switch branches first or update the repo context."
+            "Git is blocked because remote changes are not allowed through ordinary git commands. "
+            "Use setup_git_context(...) with explicit confirmation instead."
         )
+
+    if subcommand == "branch":
+        if _is_git_branch_read_only(tail):
+            return
+        branch_target = _branch_target(tail)
+        if branch_target and branch_target != target_branch:
+            raise ValueError(
+                f"Git is blocked because branch operations for this workspace must stay on {target_branch}, "
+                f"but the command targets {branch_target}."
+            )
+        _require_current_branch_matches(current_branch, target_branch)
+        return
+
+    if subcommand == "checkout":
+        branch_target = _checkout_target_branch(tail)
+        if branch_target:
+            if branch_target != target_branch:
+                raise ValueError(
+                    f"Git is blocked because checkout for this workspace must stay on {target_branch}, "
+                    f"but the command targets {branch_target}."
+                )
+            return
+        _require_current_branch_matches(current_branch, target_branch)
+        return
+
+    if subcommand == "switch":
+        branch_target = _switch_target_branch(tail)
+        if branch_target:
+            if branch_target != target_branch:
+                raise ValueError(
+                    f"Git is blocked because switch for this workspace must stay on {target_branch}, "
+                    f"but the command targets {branch_target}."
+                )
+            return
+        _require_current_branch_matches(current_branch, target_branch)
+        return
+
+    if subcommand == "fetch":
+        remote_target = _fetch_remote(tail)
+        if remote_target == "__ALL__":
+            for remote_name in sorted(detected.get("remotes", {})):
+                _ensure_remote_reference_allowed(remote_name, config, detected, context="git fetch --all")
+            return
+        _ensure_remote_reference_allowed(remote_target, config, detected, context="git fetch")
+        return
+
+    if subcommand == "pull":
+        _require_current_branch_matches(current_branch, target_branch)
+        remote_target, branch_target = _pull_remote_and_branch(tail)
+        _ensure_remote_reference_allowed(remote_target, config, detected, context="git pull")
+        if branch_target and branch_target != target_branch:
+            raise ValueError(
+                f"Git is blocked because pull for this workspace must stay on {target_branch}, "
+                f"but the command targets {branch_target}."
+            )
+        return
+
+    if subcommand == "push":
+        _require_current_branch_matches(current_branch, target_branch)
+        remote_target, refspecs = _push_remote_and_refspecs(tail)
+        _ensure_remote_reference_allowed(remote_target, config, detected, context="git push")
+        for refspec in refspecs:
+            ref_target = _refspec_target_branch(refspec, current_branch)
+            if ref_target != target_branch:
+                raise ValueError(
+                    f"Git is blocked because push for this workspace must stay on {target_branch}, "
+                    f"but the command targets {ref_target}."
+                )
+        return
+
+    if subcommand == "tag":
+        if _is_git_tag_read_only(tail):
+            return
+        _require_current_branch_matches(current_branch, target_branch)
+        return
+
+    branch_bound_commands = {
+        "add",
+        "rm",
+        "mv",
+        "restore",
+        "reset",
+        "clean",
+        "stash",
+        "commit",
+        "merge",
+        "rebase",
+        "cherry-pick",
+        "revert",
+        "am",
+    }
+    if subcommand in branch_bound_commands:
+        _require_current_branch_matches(current_branch, target_branch)
+        return
+
+    raise ValueError(
+        f"Git is blocked because the command '{subcommand}' is not yet explicitly classified by the repo policy."
+    )
 
 
 def _read_text_with_replace(path: Path) -> str:
@@ -820,9 +1403,11 @@ def _slice_chunk(
     offset: int = 0,
     limit: int = 0,
     char_limit: int = CHUNK_CHAR_LIMIT,
+    char_offset: int = 0,
 ) -> dict[str, object]:
     lines = text.splitlines(keepends=True)
     start = max(0, offset)
+    start_char_offset = max(0, char_offset if start < len(lines) else 0)
     line_limit = max(1, min(limit or DEFAULT_READ_LINES, 2000))
     total = len(lines)
 
@@ -830,85 +1415,120 @@ def _slice_chunk(
         return {
             "start": start,
             "end": start,
+            "next_offset": start,
+            "next_char_offset": 0,
             "total": total,
             "body": "(end of content)",
             "reason": None,
-            "oversized_line_chars": None,
             "is_complete": True,
             "char_limit": char_limit,
+            "line_fragment": False,
         }
 
     selected: list[str] = []
     selected_chars = 0
     stop_reason: str | None = None
-    oversized_line_chars: int | None = None
+    next_offset = start
+    next_char_offset = start_char_offset
+    line_fragment = False
+    consumed_lines = 0
 
     for index in range(start, total):
         line = lines[index]
-        if len(selected) >= line_limit:
+        current_char_offset = next_char_offset if index == start else 0
+        remaining_line = line[current_char_offset:]
+
+        if consumed_lines >= line_limit:
             stop_reason = "line limit"
+            next_offset = index
+            next_char_offset = 0
             break
-        if selected_chars + len(line) > char_limit:
+
+        if selected_chars + len(remaining_line) > char_limit:
             stop_reason = "character limit"
-            if not selected:
-                oversized_line_chars = len(line)
+            available = char_limit - selected_chars
+            if available > 0:
+                selected.append(remaining_line[:available])
+                selected_chars += available
+                next_offset = index
+                next_char_offset = current_char_offset + available
+                line_fragment = next_char_offset < len(line)
+            else:
+                next_offset = index
+                next_char_offset = current_char_offset
             break
-        selected.append(line)
-        selected_chars += len(line)
 
-    end = start + len(selected)
-    is_complete = end >= total
-
-    if oversized_line_chars is not None:
-        body = (
-            f"(line {start + 1} is {oversized_line_chars:,} chars long, exceeds the safe response limit "
-            f"of {char_limit:,}, and is not split automatically.)"
-        )
+        selected.append(remaining_line)
+        selected_chars += len(remaining_line)
+        consumed_lines += 1
+        next_offset = index + 1
+        next_char_offset = 0
     else:
-        body = "".join(selected) or "(empty result)"
+        next_offset = total
+        next_char_offset = 0
+
+    is_complete = next_offset >= total and next_char_offset == 0
+    body = "".join(selected) or "(empty result)"
 
     return {
         "start": start,
-        "end": end,
+        "end": start + consumed_lines,
+        "next_offset": next_offset,
+        "next_char_offset": next_char_offset,
         "total": total,
         "body": body,
         "reason": stop_reason,
-        "oversized_line_chars": oversized_line_chars,
         "is_complete": is_complete,
         "char_limit": char_limit,
+        "line_fragment": line_fragment,
     }
 
 
 def _render_chunk_text(chunk: dict[str, object], source_label: str) -> tuple[str, bool]:
     start = int(chunk["start"])
     end = int(chunk["end"])
+    next_offset = int(chunk["next_offset"])
+    next_char_offset = int(chunk["next_char_offset"])
     total = int(chunk["total"])
     body = str(chunk["body"])
     reason = chunk["reason"]
     is_complete = bool(chunk["is_complete"])
-    oversized_line_chars = chunk["oversized_line_chars"]
 
-    header = f"[lines {start}–{end} of {total} | next offset {end}]"
-    if oversized_line_chars is not None:
-        return header + "\n" + body, False
-    if end < total:
+    char_suffix = f" | next char offset {next_char_offset}" if next_char_offset else ""
+    header = f"[lines {start}–{end} of {total} | next offset {next_offset}{char_suffix}]"
+    if next_offset < total or next_char_offset:
+        continue_args = f"path={source_label!r}, offset={next_offset}"
+        if next_char_offset:
+            continue_args += f", char_offset={next_char_offset}"
         footer = (
-            f"\n\n... [{total - end} more lines hidden. Stopped by {reason or 'character limit'}. "
-            f"Call read_file(path={source_label!r}, offset={end}) to continue.]"
+            f"\n\n... [more content hidden. Stopped by {reason or 'character limit'}. "
+            f"Call read_file({continue_args}) to continue.]"
         )
     else:
         footer = ""
     return header + "\n" + body + footer, is_complete
 
 
-def _format_chunk_text(text: str, source_label: str, offset: int = 0, limit: int = 0) -> tuple[str, bool]:
+def _format_chunk_text(
+    text: str,
+    source_label: str,
+    offset: int = 0,
+    limit: int = 0,
+    char_offset: int = 0,
+) -> tuple[str, bool]:
     working_char_limit = CHUNK_CHAR_LIMIT
 
     while True:
-        chunk = _slice_chunk(text, offset=offset, limit=limit, char_limit=working_char_limit)
+        chunk = _slice_chunk(
+            text,
+            offset=offset,
+            limit=limit,
+            char_limit=working_char_limit,
+            char_offset=char_offset,
+        )
         rendered, is_complete = _render_chunk_text(chunk, source_label)
         overflow = len(rendered) - MAX_OUTPUT_CHARS
-        if overflow <= 0 or chunk["oversized_line_chars"] is not None:
+        if overflow <= 0:
             return rendered, is_complete
         reduced = max(1, working_char_limit - overflow)
         if reduced >= working_char_limit:
@@ -1037,12 +1657,12 @@ async def workspace_info() -> str:
     """Show the allowed workspace, active mode, and git repo-context status."""
     commands = ", ".join(sorted(ALLOWED_COMMANDS)) if ALLOW_COMMANDS else "disabled"
     mode = "trusted developer mode" if ALLOW_COMMANDS else "file-only mode"
-    repo_summary = await asyncio.to_thread(_repo_context_summary, BASE_DIR)
+    repo_overview = await asyncio.to_thread(_workspace_repo_overview, BASE_DIR)
     return (
         f"workspace: {BASE_DIR}\nmode: {mode}\ncommands: {commands}\n"
         f"max text file: {MAX_TEXT_FILE:,} bytes\n"
         f"repo context file: {REPO_CONTEXT_FILE}\n"
-        f"{repo_summary}"
+        f"{repo_overview}"
     )
 
 
@@ -1072,26 +1692,59 @@ async def configure_repo_context(
     default_branch: str = "",
     branch_mode: str = "default_branch",
     commit_branch: str = "",
+    cwd: str = ".",
+    confirm_defaults: bool = False,
+    confirm_reconfigure: bool = False,
 ) -> str:
     """Low-level manual override for the local repo-context file. Prefer setup_git_context() for normal use."""
-    detected = await asyncio.to_thread(_detect_git_repo, BASE_DIR)
+    workdir = _path(cwd)
+    if not workdir.is_dir():
+        raise ValueError(f"cwd is not a directory: {cwd}")
+    try:
+        existing = await asyncio.to_thread(_load_repo_context, workdir)
+    except ValueError:
+        existing = None
+    detected = await asyncio.to_thread(_detect_git_repo, workdir)
     branch_mode = branch_mode.strip() or "default_branch"
-    inferred_default_branch = default_branch.strip() or str(detected["branch"] or "").strip()
-    config_path = await asyncio.to_thread(
-        _save_repo_context,
+    default_branch = default_branch.strip()
+    defaults_used: list[str] = []
+    if branch_mode == "specified_branch" and not commit_branch.strip():
+        raise ValueError("commit_branch is required when branch_mode='specified_branch'")
+    if branch_mode == "default_branch" and not default_branch:
+        inferred_default_branch = str(detected["branch"] or "").strip()
+        if not inferred_default_branch:
+            raise ValueError("default_branch must be explicitly set when it cannot be inferred safely")
+        default_branch = inferred_default_branch
+        defaults_used.append(f"default_branch='{default_branch}'")
+    _require_explicit_defaults(defaults_used, confirm_defaults)
+    desired = _build_repo_context_desired(
         status="configured",
         repository_url=repository_url,
         is_fork=is_fork,
         upstream_url=upstream_url,
-        default_branch=inferred_default_branch,
+        default_branch=default_branch,
+        branch_mode=branch_mode,
+        commit_branch=commit_branch,
+        git_enabled=True,
+        disabled_reason="",
+    )
+    _require_repo_context_confirmation(existing, desired, confirm_reconfigure)
+    config_path = await asyncio.to_thread(
+        _save_repo_context,
+        cwd=workdir,
+        status="configured",
+        repository_url=repository_url,
+        is_fork=is_fork,
+        upstream_url=upstream_url,
+        default_branch=default_branch,
         branch_mode=branch_mode,
         commit_branch=commit_branch,
         git_enabled=True,
         disabled_reason="",
         last_detected_origin=str(detected["origin_url"]),
-        last_detected_branch=str(detected["branch"] or inferred_default_branch),
+        last_detected_branch=str(detected["branch"] or default_branch),
     )
-    summary = await asyncio.to_thread(_repo_context_summary, BASE_DIR)
+    summary = await asyncio.to_thread(_repo_context_summary, workdir)
     return f"Saved repo context to {config_path.relative_to(BASE_DIR)}\n\n{summary}"
 
 
@@ -1108,6 +1761,8 @@ async def setup_git_context(
     disable_reason: str = "",
     force_origin_update: bool = False,
     set_upstream_remote: bool = False,
+    confirm_defaults: bool = False,
+    confirm_reconfigure: bool = False,
 ) -> str:
     """Safely initialize, bind, rebind, or disable git for this workspace before ordinary git commands are allowed."""
     workdir = _path(cwd)
@@ -1126,6 +1781,8 @@ async def setup_git_context(
         disable_reason=disable_reason,
         force_origin_update=force_origin_update,
         set_upstream_remote=set_upstream_remote,
+        confirm_defaults=confirm_defaults,
+        confirm_reconfigure=confirm_reconfigure,
     )
 
 
@@ -1192,7 +1849,7 @@ async def file_info(path: str) -> str:
 
 
 @tool()
-async def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
+async def read_file(path: str, offset: int = 0, limit: int = 0, char_offset: int = 0) -> str:
     """Read a text file in chunks with a character budget that takes priority over line count."""
     item, is_temp_file = _resolve_read_file_path(path)
     if not item.exists():
@@ -1201,12 +1858,19 @@ async def read_file(path: str, offset: int = 0, limit: int = 0) -> str:
         raise ValueError(f"Not a file: {item}")
 
     def _read() -> str:
+        _text_file(item)
         with item.open("rb") as handle:
             if _is_binary_bytes(handle.read(8192)):
                 label = path if is_temp_file else str(item.relative_to(BASE_DIR))
                 return f"(binary file, not shown as text): {label} — {item.stat().st_size:,} bytes"
         text_content = _read_text_with_replace(item)
-        rendered, is_complete = _format_chunk_text(text_content, path, offset=offset, limit=limit)
+        rendered, is_complete = _format_chunk_text(
+            text_content,
+            path,
+            offset=offset,
+            limit=limit,
+            char_offset=char_offset,
+        )
         if is_temp_file and is_complete:
             with contextlib.suppress(OSError):
                 item.unlink()
@@ -1399,6 +2063,68 @@ async def grep_files(
     return await asyncio.to_thread(_grep)
 
 
+async def _capture_process_to_files(
+    proc: asyncio.subprocess.Process,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout: int,
+) -> tuple[bool, bool]:
+    total = 0
+    limit_reached = asyncio.Event()
+
+    async def consume(stream: asyncio.StreamReader, target_path: Path) -> None:
+        nonlocal total
+        with target_path.open("wb") as handle:
+            while True:
+                chunk = await stream.read(8192)
+                if not chunk:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    return
+                remaining = MAX_COMMAND_OUTPUT - total
+                if remaining <= 0:
+                    limit_reached.set()
+                    continue
+                accepted = chunk[:remaining]
+                handle.write(accepted)
+                total += len(accepted)
+                if len(accepted) < len(chunk):
+                    limit_reached.set()
+
+    async def finish() -> None:
+        assert proc.stdout is not None and proc.stderr is not None
+        await asyncio.gather(
+            consume(proc.stdout, stdout_path),
+            consume(proc.stderr, stderr_path),
+            proc.wait(),
+        )
+
+    run_task = asyncio.create_task(finish())
+    limit_task = asyncio.create_task(limit_reached.wait())
+    done, _ = await asyncio.wait(
+        {run_task, limit_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    timed_out = False
+    truncated = False
+    if run_task in done:
+        await run_task
+        truncated = limit_task in done and limit_reached.is_set()
+    elif limit_task in done:
+        truncated = True
+        await _kill_tree(proc)
+        await run_task
+    else:
+        timed_out = True
+        await _kill_tree(proc)
+        await run_task
+
+    limit_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await limit_task
+    return timed_out, truncated
+
+
 @tool()
 async def run_command(
     program: str,
@@ -1427,39 +2153,39 @@ async def run_command(
 
     stdout_capture = _tool_output_path("run-command-stdout")
     stderr_capture = _tool_output_path("run-command-stderr")
-    stdout_handle = open(stdout_capture, "wb")
-    stderr_handle = open(stderr_capture, "wb")
 
     try:
         proc = await asyncio.create_subprocess_exec(
             executable,
             *(args or []),
             cwd=str(workdir),
-            stdout=stdout_handle,
-            stderr=stderr_handle,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             creationflags=flags,
         )
-        timed_out = False
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=seconds)
-        except TimeoutError:
-            timed_out = True
-            await _kill_tree(proc)
-    finally:
-        stdout_handle.close()
-        stderr_handle.close()
+        timed_out, truncated = await _capture_process_to_files(
+            proc,
+            stdout_capture,
+            stderr_capture,
+            seconds,
+        )
 
-    try:
         stdout_text = await asyncio.to_thread(_read_text_with_replace, stdout_capture)
         stderr_text = await asyncio.to_thread(_read_text_with_replace, stderr_capture)
         stdout_text = stdout_text if stdout_text != "" else "(empty result)"
         stderr_text = stderr_text if stderr_text != "" else "(empty result)"
 
-        prefix = (
-            f"Timed out after {seconds}s (process tree stopped).\n"
-            if timed_out
-            else ""
-        )
+        prefix_parts: list[str] = []
+        if timed_out:
+            prefix_parts.append(f"Timed out after {seconds}s (process tree stopped).")
+        if truncated:
+            prefix_parts.append(
+                f"Output truncated after reaching the safe combined limit of {MAX_COMMAND_OUTPUT:,} bytes."
+            )
+        prefix = "\n".join(prefix_parts)
+        if prefix:
+            prefix += "\n"
+
         result = (
             prefix
             + f"exit code: {proc.returncode}\n"

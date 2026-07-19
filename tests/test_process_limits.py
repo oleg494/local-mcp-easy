@@ -1,6 +1,9 @@
 import asyncio
+import asyncio
 import os
+import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,6 +54,61 @@ class ProcessLimitTests(unittest.TestCase):
             self.assertIsNotNone(process.returncode)
 
         asyncio.run(scenario())
+
+    def test_capture_process_to_files_is_bounded(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as directory:
+                stdout_path = Path(directory) / "stdout.txt"
+                stderr_path = Path(directory) / "stderr.txt"
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 400000)",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                timed_out, truncated = await server._capture_process_to_files(
+                    process, stdout_path, stderr_path, 10
+                )
+                self.assertFalse(timed_out)
+                self.assertTrue(truncated)
+                total = stdout_path.stat().st_size + stderr_path.stat().st_size
+                self.assertLessEqual(total, server.MAX_COMMAND_OUTPUT)
+                self.assertIsNotNone(process.returncode)
+
+        asyncio.run(scenario())
+
+    def test_read_file_can_continue_oversized_line(self):
+        test_file = PROJECT / "temp-long-line-test.txt"
+        long_line = "x" * 12000
+        test_file.write_text(long_line, encoding="utf-8")
+        try:
+            first = asyncio.run(server.read_file(path=test_file.name, limit=1))
+            self.assertIn("next char offset", first)
+            self.assertIn("Call read_file", first)
+            match = re.search(r"next offset (\d+)(?: \| next char offset (\d+))?", first)
+            self.assertIsNotNone(match)
+            next_offset = int(match.group(1))
+            next_char_offset = int(match.group(2) or 0)
+            self.assertEqual(next_offset, 0)
+            self.assertGreater(next_char_offset, 0)
+            second = asyncio.run(
+                server.read_file(path=test_file.name, offset=next_offset, char_offset=next_char_offset, limit=1)
+            )
+            self.assertNotEqual(first, second)
+        finally:
+            test_file.unlink(missing_ok=True)
+
+    def test_read_file_rejects_too_large_text_file(self):
+        test_file = PROJECT / "temp-too-large-text.txt"
+        oversized = "a" * (server.MAX_TEXT_FILE + 1024)
+        test_file.write_text(oversized, encoding="utf-8")
+        try:
+            with self.assertRaises(ValueError) as caught:
+                asyncio.run(server.read_file(path=test_file.name))
+            self.assertIn("File is too large", str(caught.exception))
+        finally:
+            test_file.unlink(missing_ok=True)
 
     def test_commands_default_to_disabled(self):
         self.assertFalse(server.ALLOW_COMMANDS)
