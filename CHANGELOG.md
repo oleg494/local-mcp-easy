@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.2 — 2026-07-20
+
+- Added a root-level `connections.cfg` file with documented Russian comments, `MENU = on` by default, and pre-created `PATH[1]`–`PATH[9]` workspace slots.
+- Added a startup workspace-selection menu that can switch projects by updating only `workspace` in `config.json`, without regenerating the MCP token or forcing the agent to reconnect.
+- First-time setup now saves the chosen workspace both to `config.json` and to the first available slot in `connections.cfg`.
+- Added support for saving new workspaces from the startup menu, reusing existing slots, extending beyond slot 9 when needed, and disabling the menu while keeping the last selected workspace as the default.
+- Updated launcher messaging and README documentation so users can see where `connections.cfg` and `config.json` live and edit them manually.
+- Added launcher regression tests for config bootstrap, workspace switching, saving new paths, extended slot numbers, and menu disable mode.
+
 ## 1.4.1 — 2026-07-19
 
 - Tightened git policy so ordinary mutating git commands such as `reset`, `checkout -B`, `tag`, `config`, and `remote set-url` no longer bypass the repo guard-layer.

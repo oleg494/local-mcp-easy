@@ -20,15 +20,18 @@ from pathlib import Path
 from typing import TextIO
 
 APP_NAME = "NotionMcpEasy"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 RUNTIME_FILE = CONFIG_DIR / "runtime.json"
 CONNECTION_FILE = CONFIG_DIR / "connection.txt"
+CONNECTIONS_FILE = SCRIPT_DIR / "connections.cfg"
 SERVER_LOG = CONFIG_DIR / "server.log"
 TUNNEL_LOG = CONFIG_DIR / "tunnel.log"
 URL_PATTERN = re.compile(r"https://[a-zA-Z0-9.-]+\.serveousercontent\.com")
+PATH_SLOT_PATTERN = re.compile(r"PATH\[(\d+)\]$", re.IGNORECASE)
+DEFAULT_CONNECTION_SLOTS = 9
 
 
 def load_json(path: Path) -> dict:
@@ -58,50 +61,293 @@ def yes_no(prompt: str, default: bool) -> bool:
         print("Please answer yes or no.")
 
 
+def normalize_workspace_path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def connections_cfg_template(menu_on: bool, paths: dict[int, str]) -> str:
+    slots = sorted(set(range(1, DEFAULT_CONNECTION_SLOTS + 1)) | set(paths))
+    lines = [
+        "# connections.cfg — сохранённые рабочие области для Notion Local MCP Easy",
+        "#",
+        "# MENU = on  -> при запуске показывать меню выбора рабочей области.",
+        f"# MENU = off -> запускать сервер сразу с областью из {CONFIG_FILE}.",
+        "#",
+        "# PATH[n] — сохранённые варианты пути к рабочей области.",
+        "# Этот файл можно редактировать вручную в любом текстовом редакторе.",
+        "# Примеры:",
+        r"# PATH[1] = C:\Users\you\Documents\project-one",
+        r"# PATH[2] = D:\Work\project-two",
+        "#",
+        f"MENU = {'on' if menu_on else 'off'}",
+        "",
+    ]
+    for slot in slots:
+        lines.append(f"PATH[{slot}] = {paths.get(slot, '')}")
+    return "\n".join(lines) + "\n"
+
+
+def ensure_connections_cfg_exists() -> None:
+    if CONNECTIONS_FILE.exists():
+        return
+    CONNECTIONS_FILE.write_text(connections_cfg_template(True, {}), encoding="utf-8")
+
+
+def load_connections_cfg() -> dict[str, object]:
+    ensure_connections_cfg_exists()
+    menu_on = True
+    paths: dict[int, str] = {}
+    text = CONNECTIONS_FILE.read_text(encoding="utf-8", errors="replace")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key.upper() == "MENU":
+            menu_on = value.lower() != "off"
+            continue
+        match = PATH_SLOT_PATTERN.fullmatch(key)
+        if match and value:
+            paths[int(match.group(1))] = value
+    return {"menu_on": menu_on, "paths": paths}
+
+
+def save_connections_cfg(menu_on: bool, paths: dict[int, str]) -> None:
+    ensure_connections_cfg_exists()
+    CONNECTIONS_FILE.write_text(
+        connections_cfg_template(menu_on, paths), encoding="utf-8"
+    )
+
+
+def first_free_connection_slot(paths: dict[int, str]) -> int | None:
+    for slot in range(1, DEFAULT_CONNECTION_SLOTS + 1):
+        if slot not in paths or not str(paths[slot]).strip():
+            return slot
+    return None
+
+
+def find_connection_slot(paths: dict[int, str], workspace: Path) -> int | None:
+    target = os.path.normcase(str(workspace))
+    for slot, saved in sorted(paths.items()):
+        try:
+            candidate = os.path.normcase(str(normalize_workspace_path(saved)))
+        except OSError:
+            continue
+        if candidate == target:
+            return slot
+    return None
+
+
+def prompt_workspace_folder(prompt: str, default_workspace: Path | None = None) -> Path:
+    while True:
+        suffix = f" [{default_workspace}]" if default_workspace is not None else ""
+        raw = input(f"{prompt}{suffix}: ").strip().strip('"')
+        workspace = (
+            normalize_workspace_path(raw)
+            if raw
+            else default_workspace.resolve() if default_workspace is not None else None
+        )
+        if workspace is None:
+            print("Введите путь к существующей папке.")
+            continue
+        if workspace.is_dir():
+            return workspace
+        print(f"Folder does not exist: {workspace}")
+
+
+def remember_workspace_path(
+    workspace: Path, *, preferred_slot: int | None = None
+) -> tuple[int, bool]:
+    connections = load_connections_cfg()
+    paths = dict(connections["paths"])
+    existing_slot = find_connection_slot(paths, workspace)
+    if existing_slot is not None:
+        return existing_slot, False
+    slot = (
+        preferred_slot
+        if preferred_slot is not None and preferred_slot not in paths
+        else first_free_connection_slot(paths)
+    )
+    if slot is None:
+        slot = max(paths, default=0) + 1
+    paths[slot] = str(workspace)
+    save_connections_cfg(bool(connections["menu_on"]), paths)
+    return slot, True
+
+
+def bootstrap_workspace_in_connections(config: dict) -> tuple[int | None, bool]:
+    workspace_raw = str(config.get("workspace", "")).strip()
+    if not workspace_raw:
+        return None, False
+    try:
+        workspace = normalize_workspace_path(workspace_raw)
+    except OSError:
+        return None, False
+    return remember_workspace_path(workspace, preferred_slot=1)
+
+
+def choose_workspace_from_connections(config: dict) -> dict:
+    slot, added = bootstrap_workspace_in_connections(config)
+    if added and slot is not None:
+        print(
+            f"Текущая рабочая область добавлена в {CONNECTIONS_FILE} (слот {slot})."
+        )
+    connections = load_connections_cfg()
+    paths = dict(connections["paths"])
+    if not bool(connections["menu_on"]):
+        return config
+
+    current_workspace = normalize_workspace_path(config["workspace"])
+    print("\n=== Меню рабочих областей Notion Local MCP Easy ===")
+    print(f"Список путей хранится в: {CONNECTIONS_FILE}")
+    print(f"Текущая рабочая область из конфига: {current_workspace}")
+    occupied = sorted(paths.items())
+    if occupied:
+        print("\nСохранённые рабочие области:")
+        for slot_number, saved_path in occupied:
+            marker = " (текущая)" if find_connection_slot({slot_number: saved_path}, current_workspace) == slot_number else ""
+            suffix = "" if Path(saved_path).expanduser().exists() else " [папка не найдена]"
+            print(f" {slot_number}. {saved_path}{marker}{suffix}")
+    else:
+        print("\nСохранённых рабочих областей пока нет.")
+    print(" 0. Задать новую рабочую область")
+    print(
+        f" q. Выключить меню и запускать сервер сразу с последней областью ({current_workspace})"
+    )
+    print(f"Подсказка: текущая активная область сохраняется в {CONFIG_FILE}")
+
+    while True:
+        choice = input("\nВыберите пункт [Enter = оставить текущую область]: ").strip().lower()
+        if not choice:
+            if current_workspace.is_dir():
+                print(
+                    f"Оставляем текущую рабочую область без изменений: {current_workspace}.\n"
+                    f"При необходимости отредактируйте {CONNECTIONS_FILE} вручную."
+                )
+                return config
+            print("Текущая рабочая область недоступна. Выберите сохранённый слот или задайте новую папку.")
+            continue
+        if choice == "q":
+            save_connections_cfg(False, paths)
+            print(
+                f"Меню отключено в {CONNECTIONS_FILE}.\n"
+                f"По умолчанию остаётся рабочая область из {CONFIG_FILE}: {current_workspace}"
+            )
+            return config
+        if not choice.isdigit():
+            print("Введите номер сохранённой области, 0 для новой области или q для отключения меню.")
+            continue
+        selected = int(choice)
+        if selected == 0:
+            default_workspace = current_workspace if current_workspace.is_dir() else SCRIPT_DIR.parent.parent.resolve()
+            workspace = prompt_workspace_folder("Новая рабочая область", default_workspace)
+            existing_slot = find_connection_slot(paths, workspace)
+            if existing_slot is not None:
+                print(
+                    f"Эта рабочая область уже сохранена в {CONNECTIONS_FILE} (слот {existing_slot})."
+                )
+            else:
+                slot_number = first_free_connection_slot(paths)
+                replaced = False
+                if slot_number is None:
+                    while True:
+                        raw_slot = input(
+                            "Свободных базовых слотов больше нет. Укажите номер для сохранения (можно 10 и выше): "
+                        ).strip()
+                        if raw_slot.isdigit() and int(raw_slot) > 0:
+                            slot_number = int(raw_slot)
+                            replaced = slot_number in paths
+                            break
+                        print("Введите положительный номер слота, например 9 или 10.")
+                paths[slot_number] = str(workspace)
+                save_connections_cfg(bool(connections["menu_on"]), paths)
+                action = "обновлён" if replaced else "сохранён"
+                print(
+                    f"Новый путь {action} в {CONNECTIONS_FILE} (слот {slot_number})."
+                )
+            config["workspace"] = str(workspace)
+            save_json(CONFIG_FILE, config)
+            print(
+                f"Текущая рабочая область обновлена в {CONFIG_FILE}. Сервер продолжит запуск с: {workspace}"
+            )
+            return config
+        if selected not in paths:
+            print(f"Слот {selected} пуст. Откройте {CONNECTIONS_FILE} или выберите другой пункт.")
+            continue
+        workspace = normalize_workspace_path(paths[selected])
+        if not workspace.is_dir():
+            print(
+                f"Сохранённая папка из слота {selected} недоступна: {workspace}.\n"
+                f"Исправьте путь в {CONNECTIONS_FILE} или задайте новую область через пункт 0."
+            )
+            continue
+        config["workspace"] = str(workspace)
+        save_json(CONFIG_FILE, config)
+        print(
+            f"Выбрана рабочая область из {CONNECTIONS_FILE} (слот {selected}).\n"
+            f"Текущий config обновлён: {CONFIG_FILE}"
+        )
+        return config
+
+
 def setup(force: bool = False) -> dict:
+    ensure_connections_cfg_exists()
     existing = load_json(CONFIG_FILE)
     if existing and not force:
-        return existing
+        return choose_workspace_from_connections(existing)
 
     print(f"\n=== Notion Local MCP Easy {VERSION}: first-time setup ===\n")
-    default_workspace = SCRIPT_DIR.parent.parent
-    raw = input(f"Workspace folder [{default_workspace}]: ").strip().strip('"')
-    workspace = Path(raw).expanduser().resolve() if raw else default_workspace.resolve()
-    while not workspace.is_dir():
-        print(f"Folder does not exist: {workspace}")
-        raw = input("Workspace folder: ").strip().strip('"')
-        workspace = Path(raw).expanduser().resolve()
+    default_workspace = (
+        normalize_workspace_path(existing["workspace"])
+        if existing.get("workspace")
+        else SCRIPT_DIR.parent.parent.resolve()
+    )
+    workspace = prompt_workspace_folder("Workspace folder", default_workspace)
 
     print("\nFile-only mode keeps MCP file operations inside the selected workspace.")
     print("Trusted developer mode adds Python/Git/Node commands with your Windows user rights.")
     print("Those programs can access files and the network outside the workspace.")
-    allow_commands = yes_no("Enable trusted developer mode?", False)
+    allow_commands = yes_no(
+        "Enable trusted developer mode?", bool(existing.get("allow_commands", False))
+    )
 
     print("\nA reserved Serveo hostname keeps the same Custom MCP URL after restarts.")
-    stable_tunnel = yes_no("Use a reserved Serveo hostname?", False)
-    serveo_hostname = ""
-    ssh_key = ""
+    stable_tunnel = yes_no(
+        "Use a reserved Serveo hostname?", bool(existing.get("serveo_hostname"))
+    )
+    serveo_hostname = str(existing.get("serveo_hostname", "")).strip().lower() if stable_tunnel else ""
+    ssh_key = str(existing.get("ssh_key", "")).strip() if stable_tunnel else ""
     if stable_tunnel:
         while not serveo_hostname:
-            raw_hostname = input("Reserved hostname (without domain): ").strip().lower()
-            serveo_hostname = raw_hostname.removesuffix(".serveousercontent.com")
+            current_hostname = serveo_hostname or ""
+            prompt = (
+                f"Reserved hostname (without domain) [{current_hostname}]"
+                if current_hostname
+                else "Reserved hostname (without domain)"
+            )
+            raw_hostname = input(f"{prompt}: ").strip().lower()
+            serveo_hostname = (raw_hostname or serveo_hostname).removesuffix(
+                ".serveousercontent.com"
+            )
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", serveo_hostname):
                 print("Use 3-63 lowercase letters, digits or hyphens.")
                 serveo_hostname = ""
-        default_key = Path.home() / ".ssh" / "serveo_notion_mcp"
-        raw_key = input(f"Serveo private SSH key [{default_key}]: ").strip().strip('"')
-        key_path = Path(raw_key).expanduser().resolve() if raw_key else default_key.resolve()
-        while not key_path.is_file():
+        default_key = Path(ssh_key).expanduser().resolve() if ssh_key else (Path.home() / ".ssh" / "serveo_notion_mcp").resolve()
+        key_path = default_key
+        while True:
+            raw_key = input(f"Serveo private SSH key [{default_key}]: ").strip().strip('"')
+            key_path = normalize_workspace_path(raw_key) if raw_key else default_key.resolve()
+            if key_path.is_file():
+                break
             print(f"Private key not found: {key_path}")
-            raw_key = input("Serveo private SSH key: ").strip().strip('"')
-            key_path = Path(raw_key).expanduser().resolve()
         ssh_key = str(key_path)
 
+    token = str(existing.get("token", "")).strip() or secrets.token_urlsafe(32)
     config = {
         "version": VERSION,
-        "token": secrets.token_urlsafe(32),
+        "token": token,
         "workspace": str(workspace),
-        "port": 8765,
+        "port": int(existing.get("port", 8765) or 8765),
         "allow_commands": allow_commands,
         "serveo_hostname": serveo_hostname,
         "ssh_key": ssh_key,
@@ -120,8 +366,13 @@ def setup(force: bool = False) -> dict:
         ],
     }
     save_json(CONFIG_FILE, config)
+    saved_slot, added_to_connections = remember_workspace_path(workspace, preferred_slot=1)
     print(f"\nConfiguration saved in: {CONFIG_FILE}")
-    print("The access token is generated automatically.\n")
+    if added_to_connections:
+        print(f"Рабочая область сохранена в {CONNECTIONS_FILE} (слот {saved_slot}).")
+    else:
+        print(f"Рабочая область уже есть в {CONNECTIONS_FILE} (слот {saved_slot}).")
+    print("Access token is stored in the config and reused on later launches.\n")
     return config
 
 
