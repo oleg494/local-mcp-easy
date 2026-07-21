@@ -17,6 +17,9 @@ def load_server(workspace: Path):
     os.environ["MCP_ALLOW_COMMANDS"] = "1"
     os.environ["MCP_ALLOWED_COMMANDS"] = "git,python"
     os.environ["MCP_SERVEO_HOSTNAME"] = ""
+    # Do not inherit oauth/dual from an active MCP session: the per-tool scope
+    # gate would reject direct in-process tool calls that have no auth context.
+    os.environ["MCP_AUTH_MODE"] = "legacy"
     sys.modules.pop("server", None)
     return importlib.import_module("server")
 

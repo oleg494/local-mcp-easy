@@ -38,6 +38,19 @@
 - Test suite grew to 140 tests (CSP form-action, owner-grant override,
   config corruption/BOM/migration, allowlist editing).
 
+### Pre-release audit follow-ups
+
+- `build_release.py` now excludes any `*.local.json` / `*.local.md` file, not
+  just the two named ones, so stray local files can never leak into an archive.
+- The `test_process_limits` and `test_repo_context` suites force
+  `MCP_AUTH_MODE=legacy` for their in-process server import, so the full suite
+  is 140/140 even when run inside an active oauth/dual MCP session (the
+  per-tool scope gate needs a request auth context that direct calls lack).
+- Documented the Streamable-HTTP/Serveo duration ceiling for long
+  `run_command` calls (detached + poll pattern, or a custom `public_url`
+  reverse proxy), and made explicit in SECURITY.md that `run_command` with an
+  interpreter is arbitrary code execution independent of the file-tool sandbox.
+
 ## 1.5.0 — 2026-07-21 (Universal OAuth)
 
 ### Universal auth modes

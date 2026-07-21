@@ -11,8 +11,11 @@ sys.path.insert(0, str(PROJECT))
 os.environ["MCP_TOKEN"] = "unit-test-token"
 os.environ["MCP_BASE_DIR"] = str(PROJECT)
 os.environ["MCP_ALLOW_COMMANDS"] = "0"
-# Tests may run inside an active MCP session; do not inherit its stable hostname.
+# Tests may run inside an active MCP session; do not inherit its stable hostname
+# or auth mode. In oauth/dual the per-tool scope gate needs a request auth
+# context, which direct in-process tool calls do not have.
 os.environ["MCP_SERVEO_HOSTNAME"] = ""
+os.environ["MCP_AUTH_MODE"] = "legacy"
 
 import server
 

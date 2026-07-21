@@ -17,7 +17,12 @@ def included_files():
         relative = path.relative_to(ROOT)
         if any(part in EXCLUDED_DIRS for part in relative.parts):
             continue
-        if path.name in EXCLUDED_FILES or path.suffix.lower() in EXCLUDED_SUFFIXES:
+        if (
+            path.name in EXCLUDED_FILES
+            or path.suffix.lower() in EXCLUDED_SUFFIXES
+            or path.name.endswith(".local.json")
+            or path.name.endswith(".local.md")
+        ):
             continue
         yield path, Path(f"local-mcp-easy-{VERSION}") / relative
 
