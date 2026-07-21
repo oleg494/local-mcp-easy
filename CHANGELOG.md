@@ -1,5 +1,49 @@
 # Changelog
 
+## 2.1.0 — 2026-07-22 (Smart dual default + Serveo authorize hint)
+
+### Default auth mode is now `dual`
+
+- Fresh installations default to **`dual`** (static Bearer token **and** OAuth
+  2.1 on the same `/mcp`) instead of `legacy`, so a new setup works with both
+  classic token clients (e.g. Notion) and OAuth clients (e.g. Hyperagent) out
+  of the box. `SETUP.bat` generates the **OAuth owner code** automatically and
+  prints it. Existing configurations are never changed on upgrade: a config
+  that predates `auth_mode` stays `legacy`, an explicitly chosen mode is
+  preserved — only brand-new installs get `dual`.
+- Open DCR + owner-code consent is therefore active out of the box. Nothing is
+  granted by registration alone: every authorization must still be approved on
+  `/consent` with the owner code (see SECURITY.md).
+
+### Temporary-URL policy relaxed for `dual` (still strict for `oauth`)
+
+- Pure **`oauth`** on a temporary tunnel URL is still **blocked** — its issuer,
+  discovery metadata, redirects and token audience would break on the next
+  restart, leaving no working auth path. **`dual`** now **warns and starts**
+  instead of blocking: the Bearer half works everywhere, so a first run on a
+  temporary URL is no longer a dead end; only the OAuth half is unstable until
+  a reserved hostname or a custom `public_url` is configured. New helper
+  `stable_url_policy()` returns `ok` / `warn` / `block`;
+  `MCP_OAUTH_ALLOW_TEMPORARY_URL=1` forces `ok`.
+
+### Friendly `/authorize` hint for the Serveo interstitial
+
+- On a free Serveo tunnel the one-time "you are about to visit…" interstitial
+  can strip the query string from the first `/authorize` hit, which made the
+  SDK answer with a raw JSON 400 (`client_id / response_type / code_challenge:
+  Field required`) in the middle of Connect. A narrow new middleware detects a
+  `GET /authorize` missing the required OAuth parameters and returns a short
+  HTML page explaining the interstitial and how to recover (press Back / retry
+  Connect, or use a custom domain / paid Serveo). Well-formed authorization
+  requests pass straight through untouched.
+
+### Tests
+
+- Suite grew to 147 tests: `stable_url_policy` classification and the
+  temporary-URL override, plus a live end-to-end check that a parameter-less
+  `/authorize` returns the HTML hint (not raw JSON) while a valid request still
+  redirects to `/consent`.
+
 ## 2.0.0 — 2026-07-22 (Local MCP Easy)
 
 ### Rename and repositioning

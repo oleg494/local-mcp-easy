@@ -366,6 +366,27 @@ class OAuthModeTests(unittest.TestCase):
         status, _, _ = http(f"{self.server.base}/health")
         self.assertEqual(status, 401)
 
+    def test_05b_authorize_missing_params_shows_friendly_hint(self):
+        # Serveo's free-tier interstitial can strip the query string on the
+        # first hit to /authorize; the middleware must replace the SDK's raw
+        # JSON 400 with a friendly HTML page -- WITHOUT touching valid requests.
+        status, headers, body = http(f"{self.server.base}/authorize")
+        self.assertEqual(status, 400)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn("Serveo", body)
+        self.assertNotIn("Field required", body)
+        # A partial (still-invalid) request is also caught.
+        status, _, body = http(f"{self.server.base}/authorize?client_id=x")
+        self.assertEqual(status, 400)
+        self.assertIn("Serveo", body)
+        # A well-formed authorize request is untouched: it still reaches the SDK
+        # handler and redirects to the consent page (302). authorize_to_consent
+        # asserts the 302 internally, so reaching a txn proves the passthrough.
+        client = self.driver.register()
+        _, challenge = pkce_pair()
+        txn, _csrf = self.driver.authorize_to_consent(client, challenge, "hint-ok")
+        self.assertTrue(txn)
+
     def test_06_read_scope_cannot_write_or_run_commands(self):
         tokens = self.driver.obtain_tokens(scope="mcp:files:read")
         headers = mcp_headers(tokens["access_token"])
