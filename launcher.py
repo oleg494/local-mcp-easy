@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TextIO
 
 APP_NAME = "LocalMcpEasy"
-# Pre-2.0 config lived here; migrate_legacy_config_dir() moves it on upgrade.
+# Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
 LEGACY_APP_NAME = "NotionMcpEasy"
 VERSION = "2.0.0"
 SCRIPT_DIR = Path(__file__).resolve().parent

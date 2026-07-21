@@ -48,7 +48,7 @@ ssh -V
 В PowerShell выполните:
 
 ```powershell
-ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\serveo_notion_mcp" -C "notion-mcp-easy"
+ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\serveo_local_mcp" -C "local-mcp-easy"
 ```
 
 Когда появится запрос passphrase, дважды нажмите **Enter**. Пустой passphrase нужен, чтобы launcher мог подключаться автоматически.
@@ -56,26 +56,26 @@ ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\serveo_notion_mcp" -C "notion-mc
 Будут созданы два файла:
 
 ```text
-%USERPROFILE%\.ssh\serveo_notion_mcp
-%USERPROFILE%\.ssh\serveo_notion_mcp.pub
+%USERPROFILE%\.ssh\serveo_local_mcp
+%USERPROFILE%\.ssh\serveo_local_mcp.pub
 ```
 
-- `serveo_notion_mcp` — приватный ключ. Никому не отправляйте.
-- `serveo_notion_mcp.pub` — публичный ключ. Его нужно добавить в Serveo.
+- `serveo_local_mcp` — приватный ключ. Никому не отправляйте.
+- `serveo_local_mcp.pub` — публичный ключ. Его нужно добавить в Serveo.
 
 ### Шаг 4. Добавьте публичный ключ в Serveo
 
 Скопируйте публичный ключ:
 
 ```powershell
-Get-Content "$env:USERPROFILE\.ssh\serveo_notion_mcp.pub" | Set-Clipboard
+Get-Content "$env:USERPROFILE\.ssh\serveo_local_mcp.pub" | Set-Clipboard
 ```
 
 В панели Serveo:
 
 1. Откройте **SSH Keys**.
 2. Нажмите **Add SSH Key**.
-3. В поле **Name** укажите `notion-mcp-easy`.
+3. В поле **Name** укажите `local-mcp-easy`.
 4. Вставьте публичный ключ.
 5. Сохраните.
 
@@ -88,17 +88,17 @@ ssh-ed25519 AAAA...
 ### Шаг 5. Зарезервируйте hostname
 
 1. В панели Serveo откройте **Domains**.
-2. Создайте новый hostname, например `my-notion-mcp`.
+2. Создайте новый hostname, например `my-mcp`.
 3. Выберите forwarding type **SSH**.
 4. Сохраните.
 
 Постоянный адрес будет выглядеть так:
 
 ```text
-https://my-notion-mcp.serveousercontent.com/mcp
+https://my-mcp.serveousercontent.com/mcp
 ```
 
-Hostname должен быть уникальным. Вводите в launcher только часть `my-notion-mcp`, без `https://` и без `.serveousercontent.com`.
+Hostname должен быть уникальным. Вводите в launcher только часть `my-mcp`, без `https://` и без `.serveousercontent.com`.
 
 ### Шаг 6. Настройте Local MCP Easy
 
@@ -135,7 +135,7 @@ START.bat
 Пример URL:
 
 ```text
-https://my-notion-mcp.serveousercontent.com/mcp
+https://my-mcp.serveousercontent.com/mcp
 ```
 
 После этого URL можно оставить в клиенте постоянно. Обычные остановки и повторные запуски не требуют пересоздания подключения.
@@ -229,5 +229,5 @@ Trusted developer mode не является песочницей: Python, Node,
 Если настройкой занимается AI-агент, можно отправить ему архив и этот запрос:
 
 ```text
-Распакуй проект, прочитай README.md, SECURITY.md и SERVEO_SETUP.md. Помоги установить и настроить Local MCP Easy. Не публикуй Bearer-токен или приватный SSH-ключ. Сначала предложи file-only mode. Для постоянного URL используй зарезервированный Serveo hostname и отдельный ключ serveo_notion_mcp.
+Распакуй проект, прочитай README.md, SECURITY.md и SERVEO_SETUP.md. Помоги установить и настроить Local MCP Easy. Не публикуй Bearer-токен или приватный SSH-ключ. Сначала предложи file-only mode. Для постоянного URL используй зарезервированный Serveo hostname и отдельный ключ serveo_local_mcp.
 ```

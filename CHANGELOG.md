@@ -131,7 +131,7 @@
   it as a stable URL, skips Serveo tunnel management (operator runs their own
   reverse proxy) and no longer overwrites it.
 - Release note: the distributable is the audited `build_release.py` archive
-  (`release/notion-mcp-easy-<version>.zip`), never the working directory —
+  (`release/local-mcp-easy-<version>.zip`; `notion-mcp-easy-*` on the 1.x line), never the working directory —
   the working directory's `.git` must not be shipped.
 
 ### Maintenance (previously unreleased)

@@ -547,6 +547,66 @@ class StoreResilienceTests(unittest.TestCase):
         store = self._store_from("not json at all")
         self.assertEqual(store.clients, {})
 
+    def test_utf8_bom_state_file_loads(self):
+        # A BOM (e.g. from a text editor) must not silently reset the state.
+        path = Path(tempfile.mktemp())
+        path.write_text(
+            '{"version": 1, "clients": {"a": {"client_id": "a"}}}',
+            encoding="utf-8-sig",
+        )
+        store = OAuthStore(path)
+        self.assertIn("a", store.clients)
+
+
+class InMemoryCapTests(unittest.TestCase):
+    """m2: pending transactions and used-code markers are bounded by count,
+    not only by TTL, so a burst of public /authorize|/token cannot grow them
+    without limit."""
+
+    def setUp(self):
+        self.provider = LocalOAuthProvider(
+            store=OAuthStore(Path(tempfile.mktemp())),
+            issuer_url=ISSUER,
+            canonical_resource=RESOURCE,
+        )
+
+    def test_pending_txns_are_capped(self):
+        import auth.oauth as oauth_mod
+
+        original = oauth_mod.MAX_PENDING_TXNS
+        oauth_mod.MAX_PENDING_TXNS = 5
+        try:
+            base = time.time()
+            for i in range(20):
+                txn = PendingAuthorization(
+                    txn_id=f"t{i}", client=make_client(), params=make_params(),
+                    csrf="c", created_at=base + i,
+                )
+                self.provider._txns[txn.txn_id] = txn
+            self.provider._prune_txns()
+            self.assertLessEqual(len(self.provider._txns), 5)
+            # Newest transactions survive; oldest are evicted.
+            self.assertIn("t19", self.provider._txns)
+            self.assertNotIn("t0", self.provider._txns)
+        finally:
+            oauth_mod.MAX_PENDING_TXNS = original
+
+    def test_used_codes_are_capped(self):
+        import auth.oauth as oauth_mod
+
+        original = oauth_mod.MAX_USED_CODES
+        oauth_mod.MAX_USED_CODES = 5
+        try:
+            now = time.time()
+            for i in range(20):
+                self.provider._used_codes[f"c{i}"] = ("a", "r", now + i)
+            self.provider._prune_used_codes()
+            self.assertLessEqual(len(self.provider._used_codes), 5)
+            self.assertIn("c19", self.provider._used_codes)
+            self.assertNotIn("c0", self.provider._used_codes)
+        finally:
+            oauth_mod.MAX_USED_CODES = original
+
 
 class ClientRegistryTests(ProviderTestBase):
     def _provider(self, max_clients: int, unused_ttl: int = 3600) -> LocalOAuthProvider:

@@ -64,10 +64,14 @@ def resolve_program(base_dir: Path, program: str, allowed: set[str]) -> str:
         )
 
     if any(sep in program for sep in ("/", "\\")) or Path(program).is_absolute():
-        candidate = safe_path(base_dir, program)
-        if not candidate.is_file():
-            raise ValueError(f"Program does not exist: {candidate}")
-        return str(candidate)
+        # Reject path-qualified programs. Otherwise a client holding
+        # mcp:files:write could drop an executable inside the workspace whose
+        # basename matches an allow-listed name (e.g. sub/git.exe) and run it,
+        # bypassing the allow-list. Require a bare name resolved from PATH.
+        raise ValueError(
+            "Path-qualified programs are not allowed; install the tool and "
+            "reference it by bare name (resolved from the system PATH)."
+        )
 
     resolved = shutil.which(program)
     if not resolved:

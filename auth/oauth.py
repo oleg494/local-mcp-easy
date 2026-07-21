@@ -62,6 +62,10 @@ DEFAULT_MAX_CLIENTS = 100
 # this long. Real clients finish DCR -> authorize -> token within seconds, so
 # this both bounds storage and lets a registration flood self-heal quickly.
 DEFAULT_UNUSED_CLIENT_TTL = 3600
+# Hard count caps (independent of TTL) so a burst of public /authorize or
+# /token calls cannot grow these in-memory maps without bound.
+MAX_PENDING_TXNS = 512
+MAX_USED_CODES = 4096
 
 ACCESS_PREFIX = "mcp_at_"
 REFRESH_PREFIX = "mcp_rt_"
@@ -120,7 +124,9 @@ class OAuthStore:
 
     def _load(self) -> None:
         try:
-            raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+            # utf-8-sig tolerates a BOM (symmetry with the launcher config
+            # loader); a BOM would otherwise silently reset the whole state.
+            raw = json.loads(self.state_file.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return
         if not isinstance(raw, dict):
@@ -340,6 +346,12 @@ class LocalOAuthProvider:
 
     def _prune_txns(self) -> None:
         self._txns = {key: txn for key, txn in self._txns.items() if not txn.expired()}
+        if len(self._txns) > MAX_PENDING_TXNS:
+            # Bound memory under a burst of /authorize calls: drop the oldest.
+            for key in sorted(self._txns, key=lambda k: self._txns[k].created_at)[
+                : len(self._txns) - MAX_PENDING_TXNS
+            ]:
+                self._txns.pop(key, None)
 
     def _prune_codes(self) -> None:
         now = _now()
@@ -354,6 +366,11 @@ class LocalOAuthProvider:
             for code, entry in self._used_codes.items()
             if entry[2] > cutoff
         }
+        if len(self._used_codes) > MAX_USED_CODES:
+            for code in sorted(self._used_codes, key=lambda c: self._used_codes[c][2])[
+                : len(self._used_codes) - MAX_USED_CODES
+            ]:
+                self._used_codes.pop(code, None)
 
     def get_txn(self, txn_id: str) -> PendingAuthorization | None:
         self._prune_txns()

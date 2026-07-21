@@ -61,6 +61,13 @@ class ProgramNameTests(unittest.TestCase):
         resolved = resolve_program(Path.cwd(), "python", {"python"})
         self.assertTrue(Path(resolved).is_file())
 
+    def test_path_qualified_program_is_rejected(self):
+        # A client with files:write must not be able to drop e.g. sub/git.exe
+        # inside the workspace and run it under an allow-listed basename.
+        for bad in ("sub/git", "sub\\git.exe", str(Path.cwd() / "git")):
+            with self.assertRaises(ValueError):
+                resolve_program(Path.cwd(), bad, {"git"})
+
 
 class ExcludeTests(unittest.TestCase):
     def test_hidden_is_skipped_by_default(self):
