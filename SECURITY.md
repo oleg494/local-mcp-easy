@@ -1,6 +1,6 @@
 # Security model
 
-Notion Local MCP Easy is intended for **personal, trusted use on your own Windows computer**.
+Local MCP Easy is intended for **personal, trusted use on your own Windows computer**.
 
 ## Default mode
 
@@ -35,7 +35,7 @@ New installations start in **file-only mode**. Built-in file tools resolve paths
   fails and revokes the related tokens. `POST /revoke` is supported.
 - Registered redirect URIs must be absolute https (or http on loopback) with
   a host and without a fragment or userinfo component.
-- `oauth_state.json` in `%LOCALAPPDATA%\NotionMcpEasy` stores registered
+- `oauth_state.json` in `%LOCALAPPDATA%\LocalMcpEasy` stores registered
   clients and **SHA-256 hashes** of tokens; raw access/refresh tokens are
   never written to disk or logs. A corrupted or hand-edited state file never
   crashes startup — the server falls back to a clean state. Client secrets of
@@ -61,7 +61,7 @@ New installations start in **file-only mode**. Built-in file tools resolve paths
 
 ## Trusted developer mode
 
-The setup wizard can enable commands such as Python, Git and Node. This mode is **not a sandbox**. Interpreters and build tools can access the wider filesystem, network and processes with the rights of the current Windows user. Git still has an extra guard: MCP blocks ordinary git commands until the workspace completes an explicit local setup-flow, it requires the user to choose whether commits belong on the default branch or on a named branch, and it refuses git whenever the detected `origin` does not match the saved binding after a restart. Enable it only when the connected Notion agent and everyone who can access its settings are trusted.
+The setup wizard can enable commands such as Python, Git and Node. This mode is **not a sandbox**. Interpreters and build tools can access the wider filesystem, network and processes with the rights of the current Windows user. Git still has an extra guard: MCP blocks ordinary git commands until the workspace completes an explicit local setup-flow, it requires the user to choose whether commits belong on the default branch or on a named branch, and it refuses git whenever the detected `origin` does not match the saved binding after a restart. Enable it only when every connected MCP client (and everyone who can access its settings) is trusted.
 
 ## Tunnel
 
@@ -69,7 +69,7 @@ Serveo is a third-party SSH tunnel. The public URL and Bearer token must be trea
 
 ## Secret handling
 
-Configuration is stored in `%LOCALAPPDATA%\NotionMcpEasy`, not in the project folder or release archive. Large temporary MCP outputs are stored in `temp/` next to `server.py`, not inside the selected workspace. Release ZIP files are built into `release/` inside the project, and that folder is intentionally excluded from both Git sync and the release archive itself. The local git binding file `agent-repo-config.local.json` stays in the project root and is intentionally excluded from release archives and normal Git sync. This file records whether git is configured, rebound, or explicitly disabled for the folder, plus the chosen commit-branch policy, so MCP can safely recover after a restart. Never post `connection.txt`, `config.json`, the tunnel URL, the token, or `@temp/...` output files in a public chat.
+Configuration is stored in `%LOCALAPPDATA%\LocalMcpEasy`, not in the project folder or release archive. Large temporary MCP outputs are stored in `temp/` next to `server.py`, not inside the selected workspace. Release ZIP files are built into `release/` inside the project, and that folder is intentionally excluded from both Git sync and the release archive itself. The local git binding file `agent-repo-config.local.json` stays in the project root and is intentionally excluded from release archives and normal Git sync. This file records whether git is configured, rebound, or explicitly disabled for the folder, plus the chosen commit-branch policy, so MCP can safely recover after a restart. Never post `connection.txt`, `config.json`, the tunnel URL, the token, or `@temp/...` output files in a public chat.
 
 ## Reporting
 

@@ -293,7 +293,7 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
             provider=self.provider,
             owner_code="owner-code-1",
             server_name="Test MCP",
-            server_version="1.5.0",
+            server_version="2.0.0",
             max_attempts_per_txn=3,
             failure_window_seconds=60,
             max_failures_per_window=100,
@@ -329,6 +329,15 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(txn.csrf, response.text)
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertEqual(response.headers["x-frame-options"], "DENY")
+
+    async def test_form_action_csp_allows_client_redirect_origin(self):
+        # Without the client's redirect origin in form-action, CSP 3 browsers
+        # block the post-approval 302 back to the client. The consent page must
+        # allow 'self' plus the client's redirect origin.
+        txn = await self._make_txn()
+        response = self.http.get(f"/consent?txn={txn.txn_id}")
+        csp = response.headers["content-security-policy"]
+        self.assertIn("form-action 'self' https://client.example", csp)
 
     async def test_wrong_csrf_is_rejected(self):
         txn = await self._make_txn()
@@ -389,7 +398,7 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
             provider=self.provider,
             owner_code="owner-code-1",
             server_name="Test MCP",
-            server_version="1.5.0",
+            server_version="2.0.0",
             max_attempts_per_txn=1000,
             failure_window_seconds=60,
             max_failures_per_window=3,
@@ -635,6 +644,45 @@ class DefaultScopeTests(unittest.TestCase):
             txn_id="t", client=client, params=params, csrf="c"
         )
         self.assertEqual(set(provider.granted_scopes(txn)), set(DEFAULT_SCOPES))
+
+
+class OwnerGrantScopesTests(unittest.TestCase):
+    def _provider(self, owner_scopes):
+        return LocalOAuthProvider(
+            store=OAuthStore(Path(tempfile.mktemp())),
+            issuer_url=ISSUER,
+            canonical_resource=RESOURCE,
+            owner_grant_scopes=owner_scopes,
+        )
+
+    def _txn(self, requested):
+        params = make_params()
+        params.scopes = requested
+        return PendingAuthorization(
+            txn_id="t", client=make_client(scope=" ".join(ALL_SCOPES)),
+            params=params, csrf="c",
+        )
+
+    def test_override_replaces_requested_scopes(self):
+        provider = self._provider([SCOPE_FILES_READ, SCOPE_GIT])
+        # Client requested everything, but the owner override wins.
+        granted = provider.granted_scopes(self._txn(list(ALL_SCOPES)))
+        self.assertEqual(set(granted), {SCOPE_FILES_READ, SCOPE_GIT})
+
+    def test_override_filters_invalid_scopes(self):
+        provider = self._provider([SCOPE_FILES_READ, "mcp:bogus"])
+        self.assertEqual(provider.owner_grant_scopes, [SCOPE_FILES_READ])
+
+    def test_no_override_by_default(self):
+        provider = self._provider(None)
+        self.assertIsNone(provider.owner_grant_scopes)
+        # Falls back to requested scopes when no override is configured.
+        granted = provider.granted_scopes(self._txn([SCOPE_FILES_READ]))
+        self.assertEqual(granted, [SCOPE_FILES_READ])
+
+    def test_empty_override_is_disabled(self):
+        provider = self._provider([])
+        self.assertIsNone(provider.owner_grant_scopes)
 
 
 if __name__ == "__main__":

@@ -469,5 +469,77 @@ class OAuthLauncherTests(unittest.TestCase):
             self.assertIn("owne...alue", output)
 
 
+class ConfigRobustnessTests(unittest.TestCase):
+    def test_setup_aborts_on_corrupt_config_without_overwriting(self):
+        # Regression: a corrupt config.json (e.g. hand-edit with a stray comma
+        # or a BOM) must NOT silently trigger first-time setup and regenerate
+        # the token. It must abort and leave the file untouched.
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / "config.json"
+            connections = Path(directory) / "connections.cfg"
+            original = '{"token": "keepme", "allowed_commands": ["git",,,]}'
+            cfg.write_text(original, encoding="utf-8")
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", cfg),
+                mock.patch.object(launcher, "CONNECTIONS_FILE", connections),
+            ):
+                with self.assertRaises(SystemExit):
+                    launcher.setup(force=False)
+            self.assertEqual(cfg.read_text(encoding="utf-8"), original)
+
+    def test_load_json_tolerates_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            # Windows editors often add a UTF-8 BOM; it must not break parsing.
+            path.write_text('{"token": "x"}', encoding="utf-8-sig")
+            self.assertEqual(launcher.load_json(path), {"token": "x"})
+
+    def test_missing_config_is_treated_as_first_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / "config.json"
+            with mock.patch.object(launcher, "CONFIG_FILE", cfg):
+                self.assertEqual(launcher.load_config_or_abort(), {})
+
+    def test_add_command_is_parse_safe_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / "config.json"
+            cfg.write_text(
+                json.dumps({"token": "t", "allowed_commands": ["git"]}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(launcher, "CONFIG_FILE", cfg):
+                self.assertEqual(launcher.modify_allowed_commands(add=["gh"]), 0)
+                self.assertEqual(launcher.modify_allowed_commands(add=["gh"]), 0)
+            saved = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(saved["allowed_commands"]), ["gh", "git"])
+
+    def test_remove_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / "config.json"
+            cfg.write_text(
+                json.dumps({"token": "t", "allowed_commands": ["git", "gh"]}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(launcher, "CONFIG_FILE", cfg):
+                self.assertEqual(launcher.modify_allowed_commands(remove=["gh"]), 0)
+            saved = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(saved["allowed_commands"], ["git"])
+
+    def test_migrate_legacy_config_dir_copies_old_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "NotionMcpEasy"
+            legacy.mkdir()
+            (legacy / "config.json").write_text('{"token": "old"}', encoding="utf-8")
+            new_dir = root / "LocalMcpEasy"
+            with (
+                mock.patch.object(launcher, "CONFIG_DIR", new_dir),
+                mock.patch.object(launcher, "LEGACY_APP_NAME", "NotionMcpEasy"),
+            ):
+                launcher.migrate_legacy_config_dir()
+            self.assertTrue((new_dir / "config.json").is_file())
+            self.assertIn("old", (new_dir / "config.json").read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

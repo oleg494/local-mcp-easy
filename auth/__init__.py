@@ -1,8 +1,8 @@
-"""Authorization layer for Notion Local MCP Easy (Universal).
+"""Authorization layer for Local MCP Easy.
 
 Modes:
-- legacy: static master Bearer token only (1.4.x behaviour, Notion).
-- oauth:  OAuth 2.1 only (Hyperagent and other MCP clients).
+- legacy: static master Bearer token only (1.x behaviour; e.g. Notion Custom MCP).
+- oauth:  OAuth 2.1 only (Hyperagent and other OAuth-capable MCP clients).
 - dual:   both of the above on the same /mcp endpoint.
 """
 from .base import (

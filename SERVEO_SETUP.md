@@ -2,7 +2,7 @@
 
 Этот гайд предназначен для пользователей Windows, у которых нет собственного домена, VPS, ngrok или Cloudflare Tunnel.
 
-Notion Local MCP Easy поддерживает два варианта:
+Local MCP Easy поддерживает два варианта:
 
 - **Temporary mode** — запускается без аккаунта Serveo, но URL меняется после перезапуска.
 - **Stable mode** — бесплатный аккаунт Serveo, отдельный SSH-ключ и зарезервированный hostname. URL остаётся постоянным.
@@ -14,7 +14,7 @@ Notion Local MCP Easy поддерживает два варианта:
 3. Выберите workspace.
 4. Включите или отключите trusted developer mode.
 5. На вопрос `Use a reserved Serveo hostname?` ответьте `n` или нажмите Enter.
-6. Скопируйте показанные URL и Bearer-токен в настройки Custom MCP в Notion.
+6. Скопируйте показанные URL и Bearer-токен в настройки вашего MCP-клиента (например, Custom MCP в Notion). Для OAuth-клиентов (Hyperagent) токен не нужен — см. README, раздел OAuth.
 
 После следующего запуска Serveo может выдать другой URL. Этот режим подходит для проверки работы MCP.
 
@@ -100,7 +100,7 @@ https://my-notion-mcp.serveousercontent.com/mcp
 
 Hostname должен быть уникальным. Вводите в launcher только часть `my-notion-mcp`, без `https://` и без `.serveousercontent.com`.
 
-### Шаг 6. Настройте Notion Local MCP Easy
+### Шаг 6. Настройте Local MCP Easy
 
 Запустите:
 
@@ -124,7 +124,7 @@ SETUP.bat
 START.bat
 ```
 
-### Шаг 7. Добавьте MCP в Notion
+### Шаг 7. Добавьте MCP в ваш клиент
 
 В настройках Custom MCP укажите:
 
@@ -138,7 +138,7 @@ START.bat
 https://my-notion-mcp.serveousercontent.com/mcp
 ```
 
-После этого URL можно оставить в Notion постоянно. Обычные остановки и повторные запуски не требуют пересоздания подключения.
+После этого URL можно оставить в клиенте постоянно. Обычные остановки и повторные запуски не требуют пересоздания подключения.
 
 ---
 
@@ -189,21 +189,21 @@ https://my-notion-mcp.serveousercontent.com/mcp
 
 Выберите другое уникальное имя в разделе **Domains** Serveo.
 
-### Notion показывает HTTP 401
+### Клиент показывает HTTP 401
 
-Bearer-токен в Notion не совпадает с текущим токеном. Запустите `SHOW_CONNECTION.bat` и обновите токен в настройках подключения.
+Bearer-токен в клиенте не совпадает с текущим токеном. Запустите `SHOW_CONNECTION.bat` и обновите токен в настройках подключения.
 
-### Notion показывает HTTP 421
+### Клиент показывает HTTP 421
 
 Убедитесь, что используется версия 1.2.0 или новее. В ней поддерживаются публичные Serveo Host-заголовки.
 
 ### Порт 8765 занят
 
-Остановите старый MCP через `STOP.bat`. Если порт занят другим приложением, измените `port` в `%LOCALAPPDATA%\NotionMcpEasy\config.json`.
+Остановите старый MCP через `STOP.bat`. Если порт занят другим приложением, измените `port` в `%LOCALAPPDATA%\LocalMcpEasy\config.json`.
 
 ### Туннель переподключился
 
-- В temporary mode URL может измениться — обновите его в Notion.
+- В temporary mode URL может измениться — обновите его в клиенте.
 - В stable mode launcher повторно использует зарезервированный hostname, поэтому URL остаётся прежним.
 
 ---
@@ -229,5 +229,5 @@ Trusted developer mode не является песочницей: Python, Node,
 Если настройкой занимается AI-агент, можно отправить ему архив и этот запрос:
 
 ```text
-Распакуй проект, прочитай README.md, SECURITY.md и SERVEO_SETUP.md. Помоги установить и настроить Notion Local MCP Easy. Не публикуй Bearer-токен или приватный SSH-ключ. Сначала предложи file-only mode. Для постоянного URL используй зарезервированный Serveo hostname и отдельный ключ serveo_notion_mcp.
+Распакуй проект, прочитай README.md, SECURITY.md и SERVEO_SETUP.md. Помоги установить и настроить Local MCP Easy. Не публикуй Bearer-токен или приватный SSH-ключ. Сначала предложи file-only mode. Для постоянного URL используй зарезервированный Serveo hostname и отдельный ключ serveo_notion_mcp.
 ```

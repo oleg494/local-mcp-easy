@@ -1,4 +1,4 @@
-"""Shared auth primitives for Notion Local MCP Easy (Universal).
+"""Shared auth primitives for Local MCP Easy.
 
 This module defines the authorization modes and the OAuth scope model used by
 the MCP tools. It has no dependencies on the HTTP layer so it can be imported

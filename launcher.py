@@ -20,8 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-APP_NAME = "NotionMcpEasy"
-VERSION = "1.5.0"
+APP_NAME = "LocalMcpEasy"
+# Pre-2.0 config lived here; migrate_legacy_config_dir() moves it on upgrade.
+LEGACY_APP_NAME = "NotionMcpEasy"
+VERSION = "2.0.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -38,7 +40,7 @@ DEFAULT_CONNECTION_SLOTS = 9
 
 AUTH_MODES = ("legacy", "oauth", "dual")
 AUTH_MODE_DESCRIPTIONS = {
-    "legacy": "static Bearer token only (Notion, 1.4.x behaviour)",
+    "legacy": "static Bearer token only (e.g. Notion Custom MCP; 1.x behaviour)",
     "oauth": "OAuth 2.1 only (Hyperagent and other OAuth MCP clients)",
     "dual": "Bearer token AND OAuth on the same /mcp endpoint",
 }
@@ -87,10 +89,34 @@ def oauth_requires_stable_hostname(config: dict) -> bool:
 
 
 def load_json(path: Path) -> dict:
+    # utf-8-sig tolerates a UTF-8 BOM, which Windows text editors often add and
+    # which would otherwise make json.loads reject an otherwise-valid file.
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def load_config_or_abort() -> dict:
+    """Load config.json for setup, distinguishing MISSING from CORRUPT.
+
+    A missing file means genuine first-time setup. A file that EXISTS but does
+    not parse must NOT be treated as empty: doing so would run first-time setup,
+    regenerate the token and drop the OAuth settings, breaking every connected
+    client (this is exactly what happens when a hand-edit adds a stray comma or
+    a Notepad BOM). Instead, abort loudly and leave the file untouched."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"ERROR: {CONFIG_FILE} exists but is not valid JSON:\n  {exc}\n\n"
+            "Your settings were NOT changed and no new token was generated.\n"
+            "Fix the file (a stray comma or a text-editor BOM is the usual cause),\n"
+            "or delete it to run first-time setup again."
+        )
+    return data if isinstance(data, dict) else {}
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -135,7 +161,7 @@ def normalize_workspace_path(value: str | Path) -> Path:
 def connections_cfg_template(menu_on: bool, paths: dict[int, str]) -> str:
     slots = sorted(set(range(1, DEFAULT_CONNECTION_SLOTS + 1)) | set(paths))
     lines = [
-        "# connections.cfg — сохранённые рабочие области для Notion Local MCP Easy",
+        "# connections.cfg — сохранённые рабочие области для Local MCP Easy",
         "#",
         "# MENU = on  -> при запуске показывать меню выбора рабочей области.",
         f"# MENU = off -> запускать сервер сразу с областью из {CONFIG_FILE}.",
@@ -269,7 +295,7 @@ def choose_workspace_from_connections(config: dict) -> dict:
         return config
 
     current_workspace = normalize_workspace_path(config["workspace"])
-    print("\n=== Меню рабочих областей Notion Local MCP Easy ===")
+    print("\n=== Меню рабочих областей Local MCP Easy ===")
     print(f"Список путей хранится в: {CONNECTIONS_FILE}")
     print(f"Текущая рабочая область из конфига: {current_workspace}")
     occupied = sorted(paths.items())
@@ -363,11 +389,11 @@ def choose_workspace_from_connections(config: dict) -> dict:
 
 def setup(force: bool = False) -> dict:
     ensure_connections_cfg_exists()
-    existing = load_json(CONFIG_FILE)
+    existing = load_config_or_abort()
     if existing and not force:
         return choose_workspace_from_connections(existing)
 
-    print(f"\n=== Notion Local MCP Easy {VERSION}: first-time setup ===\n")
+    print(f"\n=== Local MCP Easy {VERSION}: first-time setup ===\n")
     default_workspace = (
         normalize_workspace_path(existing["workspace"])
         if existing.get("workspace")
@@ -403,7 +429,7 @@ def setup(force: bool = False) -> dict:
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", serveo_hostname):
                 print("Use 3-63 lowercase letters, digits or hyphens.")
                 serveo_hostname = ""
-        default_key = Path(ssh_key).expanduser().resolve() if ssh_key else (Path.home() / ".ssh" / "serveo_notion_mcp").resolve()
+        default_key = Path(ssh_key).expanduser().resolve() if ssh_key else (Path.home() / ".ssh" / "serveo_local_mcp").resolve()
         key_path = default_key
         while True:
             raw_key = input(f"Serveo private SSH key [{default_key}]: ").strip().strip('"')
@@ -526,7 +552,7 @@ def stop_all() -> None:
             all_stopped = stop_pid(int(raw_pid), str(expected)) and all_stopped
     if all_stopped:
         RUNTIME_FILE.unlink(missing_ok=True)
-        print("Notion Local MCP Easy is stopped.")
+        print("Local MCP Easy is stopped.")
     else:
         print("One or more PIDs were not stopped because their identity did not match.")
 
@@ -630,6 +656,11 @@ def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
             "MCP_SERVEO_HOSTNAME": hostname,
             "MCP_AUTH_MODE": auth_mode,
             "MCP_OAUTH_OWNER_CODE": str(config.get("oauth_owner_code", "")).strip(),
+            "MCP_OAUTH_OWNER_GRANT_SCOPES": " ".join(
+                config["oauth_owner_grant_scopes"]
+                if isinstance(config.get("oauth_owner_grant_scopes"), list)
+                else str(config.get("oauth_owner_grant_scopes", "")).split()
+            ),
             "MCP_PUBLIC_URL": public_url,
             "PYTHONUNBUFFERED": "1",
         }
@@ -796,7 +827,7 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
             f" OAuth owner code: {mask_token(owner_code)} (full: SHOW_CONNECTION.bat --full)",
         ]
     CONNECTION_FILE.write_text(
-        f"Notion Local MCP Easy {VERSION}\n"
+        f"Local MCP Easy {VERSION}\n"
         f"URL: {endpoint}\n"
         f"Bearer token: {config['token']}\n"
         f"Workspace: {config['workspace']}\n"
@@ -807,7 +838,7 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
         encoding="utf-8",
     )
     print("\n=======================================================")
-    print(f" Notion Local MCP Easy {VERSION} is running")
+    print(f" Local MCP Easy {VERSION} is running")
     print("=======================================================")
     print(f" URL: {endpoint}")
     print(f" Bearer token: {config['token']}")
@@ -897,7 +928,7 @@ def run() -> int:
                 elif config.get("serveo_hostname"):
                     print("Stable Serveo tunnel restored with the same URL.")
                 if not config.get("serveo_hostname"):
-                    print("IMPORTANT: the tunnel URL changed. Update the Custom MCP URL in Notion.")
+                    print("IMPORTANT: the tunnel URL changed. Update the MCP server URL in your client.")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping...")
@@ -913,6 +944,56 @@ def run() -> int:
         if server_log is not None:
             server_log.close()
         RUNTIME_FILE.unlink(missing_ok=True)
+
+
+def modify_allowed_commands(add: list[str] | None = None, remove: list[str] | None = None) -> int:
+    """Safely add/remove entries in allowed_commands without hand-editing JSON.
+
+    Hand-editing config.json is the path that broke setups (BOM / stray comma),
+    so this offers a first-class, parse-safe way to do the common change, e.g.
+    `launcher.py --add-command gh`."""
+    config = load_config_or_abort()
+    if not config:
+        print("Run SETUP.bat first: no configuration exists yet.")
+        return 1
+    commands = list(config.get("allowed_commands", []))
+    changed = False
+    for name in add or []:
+        name = name.strip().lower()
+        if name and name not in commands:
+            commands.append(name)
+            changed = True
+    for name in remove or []:
+        name = name.strip().lower()
+        if name in commands:
+            commands.remove(name)
+            changed = True
+    if changed:
+        config["allowed_commands"] = sorted(commands)
+        save_json(CONFIG_FILE, config)
+        print("Updated allowed_commands.")
+    else:
+        print("No change.")
+    print("allowed_commands:", ", ".join(sorted(commands)) or "(none)")
+    print("Restart the server (START.bat) for the change to take effect.")
+    return 0
+
+
+def migrate_legacy_config_dir() -> None:
+    """One-time upgrade migration from the pre-2.0 %LOCALAPPDATA%\\NotionMcpEasy
+    directory. When the new LocalMcpEasy config dir does not yet exist but the
+    old one does, copy it over so the token, saved workspaces, connections.cfg
+    and OAuth state survive the rename to Local MCP Easy 2.0."""
+    if CONFIG_DIR.exists():
+        return
+    legacy_dir = CONFIG_DIR.parent / LEGACY_APP_NAME
+    if not legacy_dir.is_dir():
+        return
+    try:
+        shutil.copytree(legacy_dir, CONFIG_DIR)
+        print(f"Migrated configuration from {legacy_dir} to {CONFIG_DIR}.")
+    except OSError as exc:
+        print(f"WARNING: could not migrate old config from {legacy_dir}: {exc}")
 
 
 def mask_token(token: str) -> str:
@@ -945,7 +1026,7 @@ def oauth_setup() -> int:
         print("Run SETUP.bat first: the base configuration does not exist yet.")
         return 1
     current = config_auth_mode(config)
-    print(f"\n=== Notion Local MCP Easy {VERSION}: OAuth setup ===\n")
+    print(f"\n=== Local MCP Easy {VERSION}: OAuth setup ===\n")
     print(f"Current auth mode: {current}")
     for index, mode in enumerate(AUTH_MODES, start=1):
         print(f"  {index}. {mode} — {AUTH_MODE_DESCRIPTIONS[mode]}")
@@ -1013,7 +1094,7 @@ def oauth_setup() -> int:
     save_json(CONFIG_FILE, config)
     print(f"\nAuth mode saved: {mode} ({CONFIG_FILE})")
     if mode == "dual":
-        print("Notion keeps using the Bearer token; OAuth clients connect in parallel.")
+        print("Static-token clients (e.g. Notion) keep working; OAuth clients connect in parallel.")
     elif mode == "oauth":
         print("NOTE: the Bearer token no longer works on /mcp (only /health for the launcher).")
     return 0
@@ -1034,7 +1115,7 @@ def register_oauth_client() -> int:
             "is disabled until you switch the mode with OAUTH_SETUP.bat."
         )
 
-    print(f"\n=== Notion Local MCP Easy {VERSION}: register OAuth client ===\n")
+    print(f"\n=== Local MCP Easy {VERSION}: register OAuth client ===\n")
     print("The MCP client (for example Hyperagent with 'Bring my own OAuth app')")
     print("shows a redirect/callback URL. Enter it here; several URLs are comma-separated.")
     redirect_raw = input("Redirect URI(s): ").strip()
@@ -1087,7 +1168,7 @@ def register_oauth_client() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=f"One-click launcher for Notion Local MCP Easy {VERSION}"
+        description=f"One-click launcher for Local MCP Easy {VERSION}"
     )
     parser.add_argument("--setup", action="store_true", help="run the setup wizard again")
     parser.add_argument("--stop", action="store_true", help="stop background processes")
@@ -1103,7 +1184,24 @@ def main() -> int:
         action="store_true",
         help="pre-register an OAuth client (Bring my own OAuth app)",
     )
+    parser.add_argument(
+        "--add-command",
+        action="append",
+        metavar="NAME",
+        help="safely add a program to allowed_commands (repeatable), e.g. gh",
+    )
+    parser.add_argument(
+        "--remove-command",
+        action="append",
+        metavar="NAME",
+        help="safely remove a program from allowed_commands (repeatable)",
+    )
     args = parser.parse_args()
+
+    migrate_legacy_config_dir()
+
+    if args.add_command or args.remove_command:
+        return modify_allowed_commands(add=args.add_command, remove=args.remove_command)
 
     if args.stop:
         stop_all()

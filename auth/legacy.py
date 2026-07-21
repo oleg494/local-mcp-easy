@@ -1,8 +1,8 @@
 """Constant-time verification of the static master Bearer token.
 
-This mirrors the 1.4.x behaviour: one shared secret grants full access to
+This mirrors the 1.x behaviour: one shared secret grants full access to
 every MCP tool. In ``dual`` mode this verifier runs before the OAuth token
-lookup, so Notion keeps connecting exactly as before.
+lookup, so static-token clients such as Notion keep connecting exactly as before.
 """
 from __future__ import annotations
 

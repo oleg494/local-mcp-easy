@@ -20,6 +20,7 @@ from __future__ import annotations
 import hmac
 import html
 import time
+from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -55,16 +56,31 @@ _PAGE_STYLE = """
 """
 
 
-def _security_headers(response: Response) -> Response:
+def _security_headers(response: Response, form_action_extra: str = "") -> Response:
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Frame-Options"] = "DENY"
+    form_action = "'self'"
+    if form_action_extra:
+        form_action = f"'self' {form_action_extra}"
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; "
-        "form-action 'self'"
+        f"form-action {form_action}"
     )
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
+
+
+def _redirect_origin(redirect_uri: object) -> str:
+    """Origin (scheme://host[:port]) of the client redirect URI so the consent
+    form CSP form-action can allow the post-approval 302 back to the external
+    MCP client. Without it, a 'self'-only form-action silently blocks that
+    redirect in real browsers (CSP 3 applies form-action to the resulting
+    navigation), and the client never reaches /token."""
+    parts = urlsplit(str(redirect_uri))
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return ""
 
 
 class ConsentHandler:
@@ -223,4 +239,7 @@ Return to the MCP client and start the connection again.</p>
 The owner code is shown by SHOW_CONNECTION.bat on the machine that runs this server.</p>
 </div>
 </body></html>"""
-        return _security_headers(HTMLResponse(body, status_code=status))
+        return _security_headers(
+            HTMLResponse(body, status_code=status),
+            _redirect_origin(txn.params.redirect_uri),
+        )

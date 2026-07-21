@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.0.0 — 2026-07-22 (Local MCP Easy)
+
+### Rename and repositioning
+
+- The project is now **Local MCP Easy** (`local-mcp-easy`): a universal local
+  MCP server over Streamable HTTP with OAuth 2.1, static-token and dual auth.
+  Notion is one of the compatible clients, not the project's purpose. The
+  Notion-focused 1.x line is preserved on the `legacy` branch.
+- Configuration moved to `%LOCALAPPDATA%\LocalMcpEasy`; settings from the old
+  `NotionMcpEasy` directory (token, workspaces, connections.cfg, OAuth state)
+  are migrated automatically on first run.
+- Release archives are now `local-mcp-easy-<version>.zip`.
+- Added the MIT `LICENSE` (the repository previously had no license), a
+  Russian-first `README.md`, an English `README.en.md` overview and a project
+  history section crediting the original project, the LEADBERG fork and the
+  OAuth work developed with the Hyperagent/Fable team.
+
+### Fixes and improvements over 1.5.0
+
+- **Consent page CSP fix (real-world bug):** `form-action 'self'` silently
+  blocked the post-approval redirect back to the OAuth client in browsers
+  that apply CSP Level 3 to redirects, so clients never reached `/token`.
+  The consent response now allows the client's redirect origin explicitly.
+  (Found and fixed during a live Hyperagent connection.)
+- **Owner grant override:** optional `MCP_OAUTH_OWNER_GRANT_SCOPES` /
+  `oauth_owner_grant_scopes` — on a single-owner server every approved client
+  receives a fixed scope set regardless of what it requested. Off by default;
+  invalid scopes are filtered out.
+- **Config robustness (real-world bug):** a hand-edited `config.json` with a
+  UTF-8 BOM or a stray comma used to be treated as a missing config — the
+  launcher silently ran first-time setup and regenerated the token, breaking
+  every connected client. Now: JSON is read BOM-tolerantly (`utf-8-sig`), an
+  existing-but-corrupt config aborts with a clear error WITHOUT overwriting
+  anything, and `launcher.py --add-command NAME` / `--remove-command NAME`
+  edit the command allowlist parse-safely so the file never needs hand-editing.
+- Test suite grew to 140 tests (CSP form-action, owner-grant override,
+  config corruption/BOM/migration, allowlist editing).
+
 ## 1.5.0 — 2026-07-21 (Universal OAuth)
 
 ### Universal auth modes

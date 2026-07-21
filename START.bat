@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Notion Local MCP Easy
+title Local MCP Easy
 
 if not exist ".venv\Scripts\python.exe" (
     echo [1/3] Creating local Python environment...

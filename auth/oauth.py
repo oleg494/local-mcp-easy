@@ -43,7 +43,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from .base import DEFAULT_SCOPES, normalize_resource, resources_match
+from .base import ALL_SCOPES, DEFAULT_SCOPES, normalize_resource, resources_match
 from .legacy import LegacyTokenVerifier
 
 STATE_FILE_VERSION = 1
@@ -107,7 +107,7 @@ class OAuthStore:
     """Persistent OAuth state: registered clients and hashed tokens.
 
     The state lives outside the repository and the release archive, next to
-    config.json (``%LOCALAPPDATA%\\NotionMcpEasy\\oauth_state.json`` on
+    config.json (``%LOCALAPPDATA%\\LocalMcpEasy\\oauth_state.json`` on
     Windows). Raw token values are never written to disk.
     """
 
@@ -204,6 +204,7 @@ class LocalOAuthProvider:
         refresh_ttl: int = DEFAULT_REFRESH_TTL,
         max_clients: int = DEFAULT_MAX_CLIENTS,
         unused_client_ttl: int = DEFAULT_UNUSED_CLIENT_TTL,
+        owner_grant_scopes: list[str] | None = None,
     ):
         self.store = store
         self.issuer_url = issuer_url.rstrip("/")
@@ -213,6 +214,11 @@ class LocalOAuthProvider:
         self.refresh_ttl = int(refresh_ttl)
         self.max_clients = max(1, int(max_clients))
         self.unused_client_ttl = int(unused_client_ttl)
+        self.owner_grant_scopes = (
+            [scope for scope in owner_grant_scopes if scope in ALL_SCOPES]
+            if owner_grant_scopes
+            else None
+        )
         self._txns: dict[str, PendingAuthorization] = {}
         self._codes: dict[str, AuthorizationCode] = {}
         # code -> (access_hash, refresh_hash, created_at) for replay revocation
@@ -358,6 +364,11 @@ class LocalOAuthProvider:
         self._txns.pop(txn_id, None)
 
     def granted_scopes(self, txn: PendingAuthorization) -> list[str]:
+        # Single-owner override: every token is gated by the owner code on
+        # /consent, so when the owner opts in we grant a fixed scope set
+        # regardless of what the client requested. Off by default.
+        if self.owner_grant_scopes:
+            return list(self.owner_grant_scopes)
         if txn.params.scopes:
             return list(txn.params.scopes)
         registered = (txn.client.scope or "").split()

@@ -81,7 +81,7 @@ if not TOKEN:
 if not BASE_DIR.is_dir():
     raise RuntimeError(f"MCP_BASE_DIR does not exist: {BASE_DIR}")
 
-SERVER_NAME = "Notion Local MCP Easy"
+SERVER_NAME = "Local MCP Easy"
 SERVER_VERSION = (SERVER_DIR / "VERSION").read_text(encoding="utf-8").strip() \
     if (SERVER_DIR / "VERSION").is_file() else "dev"
 
@@ -102,7 +102,7 @@ PUBLIC_URL = (os.environ.get("MCP_PUBLIC_URL", "").strip() or _default_public_ur
 PUBLIC_HOST = (urlsplit(PUBLIC_URL).hostname or "").lower()
 OAUTH_STATE_DIR = Path(
     os.environ.get("MCP_OAUTH_STATE_DIR", "").strip()
-    or Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NotionMcpEasy"
+    or Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalMcpEasy"
 )
 OAUTH_ACCESS_TTL = int(os.environ.get("MCP_OAUTH_ACCESS_TTL", "3600"))
 OAUTH_REFRESH_TTL = int(os.environ.get("MCP_OAUTH_REFRESH_TTL", str(30 * 24 * 3600)))
@@ -115,6 +115,13 @@ OAUTH_CONSENT_FAILURE_WINDOW = int(
 OAUTH_CONSENT_MAX_FAILURES = int(
     os.environ.get("MCP_OAUTH_CONSENT_MAX_FAILURES", "10")
 )
+# Optional single-owner scope override: when set, every approved client gets
+# exactly these scopes regardless of what it requested (see LocalOAuthProvider).
+OAUTH_OWNER_GRANT_SCOPES = [
+    scope
+    for scope in os.environ.get("MCP_OAUTH_OWNER_GRANT_SCOPES", "").split()
+    if scope in ALL_SCOPES
+]
 
 if OAUTH_ENABLED:
     if not OWNER_CODE:
@@ -142,6 +149,7 @@ if OAUTH_ENABLED:
         refresh_ttl=OAUTH_REFRESH_TTL,
         max_clients=OAUTH_MAX_CLIENTS,
         unused_client_ttl=OAUTH_UNUSED_CLIENT_TTL,
+        owner_grant_scopes=OAUTH_OWNER_GRANT_SCOPES or None,
     )
     _fastmcp_auth_kwargs = {
         "auth": build_auth_settings(PUBLIC_URL, SERVER_NAME),

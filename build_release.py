@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 RELEASE_DIR = ROOT / "release"
-OUTPUT = RELEASE_DIR / f"notion-mcp-easy-{VERSION}.zip"
+OUTPUT = RELEASE_DIR / f"local-mcp-easy-{VERSION}.zip"
 EXCLUDED_DIRS = {".git", ".venv", ".venv-linux", "__pycache__", ".pytest_cache", ".ruff_cache", "temp", "release"}
 EXCLUDED_SUFFIXES = {".log", ".pyc", ".zip"}
 EXCLUDED_FILES = {"connection.txt", "connections.cfg", "runtime.json", "config.json", "oauth_state.json", "agent-repo-instructions.local.md", "agent-repo-config.local.json"}
@@ -19,7 +19,7 @@ def included_files():
             continue
         if path.name in EXCLUDED_FILES or path.suffix.lower() in EXCLUDED_SUFFIXES:
             continue
-        yield path, Path(f"notion-mcp-easy-{VERSION}") / relative
+        yield path, Path(f"local-mcp-easy-{VERSION}") / relative
 
 
 def main() -> int:
