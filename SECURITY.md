@@ -4,7 +4,9 @@ Local MCP Easy is intended for **personal, trusted use on your own Windows compu
 
 ## Default mode
 
-New installations start in **file-only mode**. Built-in file tools resolve paths and reject access outside the selected workspace. The server listens only on `127.0.0.1` and, in the default `legacy` auth mode, every endpoint, including `/health`, requires the generated Bearer token.
+New installations start with the trusted developer command mode **off** (file-only): the built-in file tools resolve paths and reject access outside the selected workspace, and the server listens only on `127.0.0.1`.
+
+Since 2.1.0 the default **auth mode is `dual`** — a fresh setup accepts both the generated Bearer token and OAuth 2.1 on `/mcp`, and `SETUP.bat` generates an **OAuth owner code** automatically. Open Dynamic Client Registration and the `/consent` approval flow are therefore active out of the box, but registration grants nothing on its own: every OAuth authorization must be approved with the owner code (below), and the Bearer token remains a full-access master credential. Upgrades never change an existing config — a config that predates `auth_mode` stays `legacy`; switch modes any time with `OAUTH_SETUP.bat`. In `legacy` mode every endpoint, including `/health`, requires the generated Bearer token.
 
 ## Universal OAuth (auth modes `oauth` and `dual`)
 
@@ -52,10 +54,13 @@ New installations start in **file-only mode**. Built-in file tools resolve paths
   must be requested explicitly and granted only to fully trusted clients. The
   legacy Bearer token remains a master credential with full access in
   `legacy` and `dual` modes.
-- OAuth modes refuse to start on a temporary tunnel URL. A stable https
-  hostname is part of the security model: token audience and OAuth metadata
-  are bound to it. `MCP_OAUTH_ALLOW_TEMPORARY_URL=1` is a local-testing
-  override only.
+- Pure `oauth` mode refuses to start on a temporary tunnel URL; `dual` starts
+  with a warning instead (its Bearer half is stable, so a hard block would make
+  a first run on a temporary URL impossible, but its OAuth half stays unstable
+  until the URL is stable). A stable https hostname is part of the OAuth
+  security model: token audience and OAuth metadata are bound to it.
+  `MCP_OAUTH_ALLOW_TEMPORARY_URL=1` is a local-testing override that forces the
+  start for both.
 - In `oauth` mode the Bearer token stops working on `/mcp` and remains valid
   only for the launcher's `/health` checks.
 

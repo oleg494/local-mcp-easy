@@ -27,7 +27,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 from auth import (
     ALL_SCOPES,
@@ -2442,6 +2442,83 @@ class XApiKeyCompatMiddleware:
         await self.app(scope, receive, send)
 
 
+_AUTHORIZE_HINT_STYLE = """
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+         max-width: 34rem; margin: 8vh auto; padding: 0 1.25rem; line-height: 1.5; }
+  h1 { font-size: 1.25rem; }
+  .card { border: 1px solid rgba(128,128,128,.35); border-radius: 10px;
+          padding: 1.25rem 1.5rem; }
+  ol { padding-left: 1.2rem; }
+  li { margin: .35rem 0; }
+  code { background: rgba(128,128,128,.15); padding: .1rem .3rem; border-radius: 4px; }
+  .muted { opacity: .65; font-size: .85rem; }
+"""
+
+
+def _authorize_hint_html() -> str:
+    """HTML shown when GET /authorize arrives without the required OAuth query
+    parameters. The usual cause is the Serveo free-tier interstitial ("you are
+    about to visit...") swallowing the query string on the very first hit of a
+    browser session; the SDK would otherwise answer with a raw JSON 400
+    (client_id / response_type / code_challenge: Field required) that reads like
+    a broken server mid-Connect."""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finish connecting &mdash; {SERVER_NAME}</title>
+<style>{_AUTHORIZE_HINT_STYLE}</style></head>
+<body><div class="card">
+<h1>Almost there &mdash; one more step</h1>
+<p>This authorization link opened <strong>without its parameters</strong>, so
+sign-in can't continue yet. This is expected on the <strong>first</strong>
+visit through a free Serveo tunnel: Serveo shows a one-time
+&ldquo;you are about to visit&rdquo; page and drops the query string from the
+link.</p>
+<p><strong>How to finish:</strong></p>
+<ol>
+  <li>Press your browser&rsquo;s <strong>Back</strong> button, then open the
+  authorization link again &mdash; the Serveo page is now cleared for this
+  browser session and the real consent screen will load.</li>
+  <li>Or simply start <em>Connect</em> again from your MCP client.</li>
+</ol>
+<p class="muted">To avoid this step entirely, run the server behind your own
+domain / reverse proxy (set a custom public URL via OAUTH_SETUP.bat) or use a
+paid Serveo account with a reserved hostname &mdash; neither shows the
+interstitial. This page appears only when the authorization request is missing
+required parameters; a normal request is never interrupted.</p>
+</div></body></html>"""
+
+
+class AuthorizeHintMiddleware(BaseHTTPMiddleware):
+    """Turn the SDK's raw JSON 400 on a parameter-less /authorize into a
+    friendly HTML page.
+
+    Serveo's free-tier interstitial can strip the query string on the first
+    GET /authorize of a browser session, so the SDK sees no OAuth parameters
+    and replies with ``{"error":"invalid_request", ... Field required}``. That
+    reads like a broken server in the middle of Connect. When any required
+    OAuth parameter is absent we return an explanatory HTML page instead. The
+    match is deliberately narrow -- method GET, path exactly ``/authorize``,
+    and at least one required parameter missing -- so a well-formed
+    authorization request (which always carries all three) is passed straight
+    through to the SDK handler untouched."""
+
+    _REQUIRED_PARAMS = ("client_id", "response_type", "code_challenge")
+
+    async def dispatch(self, request, call_next):
+        if request.method == "GET" and request.url.path == "/authorize":
+            if any(
+                not request.query_params.get(name) for name in self._REQUIRED_PARAMS
+            ):
+                response = HTMLResponse(_authorize_hint_html(), status_code=400)
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["X-Content-Type-Options"] = "nosniff"
+                response.headers["X-Frame-Options"] = "DENY"
+                return response
+        return await call_next(request)
+
+
 if OAUTH_ENABLED:
     assert oauth_provider is not None
     _consent_handler = ConsentHandler(
@@ -2492,6 +2569,9 @@ if __name__ == "__main__":
     else:
         if AUTH_MODE == AUTH_MODE_DUAL:
             app.add_middleware(XApiKeyCompatMiddleware)
+        # Added before HostCheckMiddleware so host validation stays outermost;
+        # this only rewrites the SDK's raw 400 on a parameter-less /authorize.
+        app.add_middleware(AuthorizeHintMiddleware)
         app.add_middleware(HostCheckMiddleware)
     print(f"{SERVER_NAME} {SERVER_VERSION}: http://127.0.0.1:{PORT}/mcp")
     print(f"Workspace: {BASE_DIR}")

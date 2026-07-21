@@ -18,9 +18,9 @@ Compatible with Hyperagent, Notion and other MCP clients.
 
 ## Authentication modes
 
+- **Dual** — OAuth and legacy clients simultaneously on the same `/mcp` endpoint (**default** since 2.1.0)
 - **OAuth** — standards-based OAuth 2.1 with Dynamic Client Registration and PKCE (`S256`)
 - **Legacy** — static Bearer token (the classic 1.x behaviour)
-- **Dual** — OAuth and legacy clients simultaneously on the same `/mcp` endpoint
 
 ```text
 Static-token client ── Bearer ─┐
@@ -28,8 +28,10 @@ Static-token client ── Bearer ─┐
 OAuth client ──── OAuth 2.1 ───┘
 ```
 
-Pick the mode with `OAUTH_SETUP.bat`. The default is `legacy`, which behaves
-exactly like the 1.x line.
+Pick the mode with `OAUTH_SETUP.bat`. Since 2.1.0 the default for new installs
+is `dual` (Bearer token + OAuth on one endpoint) and `SETUP.bat` generates the
+owner code automatically; upgrades keep an existing config unchanged (a config
+that predates `auth_mode` stays `legacy`).
 
 ## Quick start (Windows)
 
@@ -46,9 +48,14 @@ exactly like the 1.x line.
      and opens the `/consent` page — approve it with your **owner code**.
 5. Keep the launcher window open while the server runs.
 
-OAuth modes require a stable public URL: a reserved Serveo hostname
+OAuth needs a stable public URL: a reserved Serveo hostname
 ([SERVEO_SETUP.md](SERVEO_SETUP.md)) or your own domain via a custom
-`public_url` (your reverse proxy, no Serveo involved).
+`public_url` (your reverse proxy, no Serveo involved). Pure `oauth` refuses to
+start without one; `dual` starts with a warning (the Bearer half works; the
+OAuth half stabilises once the URL is stable). On a free Serveo tunnel the
+one-time "you are about to visit…" interstitial can strip the `/authorize`
+query string on the first visit — if you hit a `Field required` error, press
+Back and retry Connect; the server shows a friendly hint page for this case.
 
 ## What's implemented (OAuth)
 
@@ -118,7 +125,7 @@ pre-2.0 `NotionMcpEasy` directory are migrated automatically on first run).
 .venv\Scripts\ruff check .
 ```
 
-The suite (140 tests) covers path traversal, token auth, the full OAuth flow
+The suite (147 tests) covers path traversal, token auth, the full OAuth flow
 (DCR, PKCE, consent, rotation, replay revocation, revocation, restart
 survival), per-tool scope enforcement, dual mode, the git guard-layer and the
 launcher.

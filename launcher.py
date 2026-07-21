@@ -23,7 +23,7 @@ from typing import TextIO
 APP_NAME = "LocalMcpEasy"
 # Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
 LEGACY_APP_NAME = "NotionMcpEasy"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -73,19 +73,49 @@ def config_uses_serveo(config: dict) -> bool:
     return not str(config.get("public_url", "")).strip()
 
 
-def oauth_requires_stable_hostname(config: dict) -> bool:
-    """OAuth metadata, redirect configuration and token audience all break
-    when the public URL changes, so oauth/dual demand a stable URL — either a
-    reserved Serveo hostname or a custom ``public_url``."""
-    if config_auth_mode(config) == "legacy":
-        return False
-    if config_public_url(config):
-        return False
-    return os.environ.get(OAUTH_TEMP_URL_OVERRIDE, "").strip().lower() not in {
+def _temporary_url_override_enabled() -> bool:
+    return os.environ.get(OAUTH_TEMP_URL_OVERRIDE, "").strip().lower() in {
         "1",
         "true",
         "yes",
     }
+
+
+def stable_url_policy(config: dict) -> str:
+    """How the configured auth mode copes with the effective public URL.
+
+    OAuth metadata, redirect configuration and token audience all break when
+    the public URL changes on restart, so the OAuth half of the server needs a
+    stable URL (a reserved Serveo hostname or a custom ``public_url``); the
+    Bearer/legacy half does not. Returns one of:
+
+    - ``"ok"``    -- safe to start: legacy mode, a stable public URL is set, or
+      the temporary-URL override is enabled.
+    - ``"warn"``  -- start but warn: ``dual`` on a temporary tunnel. The Bearer
+      token keeps working everywhere; only the OAuth half is unstable, so the
+      server still comes up (otherwise a brand-new dual install on a temporary
+      tunnel could never start on the very first run).
+    - ``"block"`` -- refuse to start: pure ``oauth`` on a temporary tunnel would
+      publish issuer/discovery/redirect metadata and token audiences that all
+      break on the next restart, leaving no working auth path at all.
+    """
+    mode = config_auth_mode(config)
+    if mode == "legacy":
+        return "ok"
+    if config_public_url(config):
+        return "ok"
+    if _temporary_url_override_enabled():
+        return "ok"
+    return "block" if mode == "oauth" else "warn"
+
+
+def oauth_requires_stable_hostname(config: dict) -> bool:
+    """True only when the configured mode cannot run at all on a temporary URL.
+
+    Kept for callers/tests that want the boolean question. Since 2.1.0 ``dual``
+    degrades to a warning rather than a hard block, so only pure ``oauth``
+    (see :func:`stable_url_policy`) truly requires a stable hostname."""
+    return stable_url_policy(config) == "block"
 
 
 def load_json(path: Path) -> dict:
@@ -440,12 +470,25 @@ def setup(force: bool = False) -> dict:
         ssh_key = str(key_path)
 
     token = str(existing.get("token", "")).strip() or secrets.token_urlsafe(32)
+    # Fresh installs default to "dual" (Bearer token + OAuth 2.1 on the same
+    # /mcp endpoint) so both classic token clients and OAuth clients work out of
+    # the box. A reconfigure (force) of an EXISTING config preserves its current
+    # effective mode: a pre-2.1 config that predates auth_mode stays "legacy",
+    # so upgrading never silently switches an operator into OAuth they did not
+    # choose. Owner code: server.py refuses to start in oauth/dual without one,
+    # so generate it here (reusing any code already configured).
+    auth_mode = config_auth_mode(existing) if existing else "dual"
+    owner_code = (
+        str(existing.get("oauth_owner_code", "")).strip() or secrets.token_urlsafe(9)
+    )
     config = {
         "version": VERSION,
         "token": token,
         "workspace": str(workspace),
         "port": int(existing.get("port", 8765) or 8765),
         "allow_commands": allow_commands,
+        "auth_mode": auth_mode,
+        "oauth_owner_code": owner_code,
         "serveo_hostname": serveo_hostname,
         "ssh_key": ssh_key,
         "allowed_commands": [
@@ -470,6 +513,17 @@ def setup(force: bool = False) -> dict:
     else:
         print(f"Рабочая область уже есть в {CONNECTIONS_FILE} (слот {saved_slot}).")
     print("Access token is stored in the config and reused on later launches.\n")
+    if config_auth_mode(config) in ("oauth", "dual"):
+        print(
+            f"Auth mode: {config_auth_mode(config)} "
+            "-- OAuth 2.1 is enabled alongside the Bearer token."
+        )
+        print("OAuth owner code (use this to approve new OAuth clients):")
+        print(f"    {config['oauth_owner_code']}")
+        print(
+            "Keep it secret. Change the mode with OAUTH_SETUP.bat; "
+            "view it later with SHOW_CONNECTION.bat --full.\n"
+        )
     return config
 
 
@@ -854,8 +908,9 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
 
 def run() -> int:
     config = setup()
-    if oauth_requires_stable_hostname(config):
-        mode = config_auth_mode(config)
+    mode = config_auth_mode(config)
+    policy = stable_url_policy(config)
+    if policy == "block":
         print(
             f"ERROR: auth mode '{mode}' requires a stable public URL.\n"
             "A temporary tunnel URL changes on every restart, which breaks the\n"
@@ -870,6 +925,17 @@ def run() -> int:
             file=sys.stderr,
         )
         return 1
+    if policy == "warn":
+        print(
+            f"WARNING: auth mode '{mode}' is starting on a temporary tunnel URL.\n"
+            "The Bearer token works normally, so classic clients (e.g. Notion)\n"
+            "can connect right away. The OAuth half is unstable on a temporary\n"
+            "URL: the issuer, discovery metadata, redirects and token audience\n"
+            "change whenever the tunnel URL changes, so OAuth clients may need to\n"
+            "reconnect after a restart. For stable OAuth, reserve a Serveo\n"
+            "hostname (SETUP.bat) or set a custom public URL (OAUTH_SETUP.bat).",
+            file=sys.stderr,
+        )
     runtime = load_json(RUNTIME_FILE)
     old_server = int(runtime.get("server_pid", 0) or 0)
     if pid_matches(old_server, str(runtime.get("server_match", "server.py"))):

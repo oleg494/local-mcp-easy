@@ -304,12 +304,36 @@ class OAuthLauncherTests(unittest.TestCase):
             launcher.oauth_requires_stable_hostname({"auth_mode": "legacy"})
         )
         self.assertTrue(launcher.oauth_requires_stable_hostname({"auth_mode": "oauth"}))
-        self.assertTrue(launcher.oauth_requires_stable_hostname({"auth_mode": "dual"}))
+        # Since 2.1.0 dual degrades to a warning on a temporary URL instead of a
+        # hard block, so it no longer "requires" a stable hostname to start.
+        self.assertFalse(launcher.oauth_requires_stable_hostname({"auth_mode": "dual"}))
         self.assertFalse(
             launcher.oauth_requires_stable_hostname(
                 {"auth_mode": "oauth", "serveo_hostname": "my-host"}
             )
         )
+
+    def test_stable_url_policy_classifies_modes(self):
+        self.assertEqual(launcher.stable_url_policy({"auth_mode": "legacy"}), "ok")
+        self.assertEqual(launcher.stable_url_policy({"auth_mode": "oauth"}), "block")
+        self.assertEqual(launcher.stable_url_policy({"auth_mode": "dual"}), "warn")
+        self.assertEqual(
+            launcher.stable_url_policy(
+                {"auth_mode": "oauth", "serveo_hostname": "my-host"}
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            launcher.stable_url_policy(
+                {"auth_mode": "dual", "public_url": "https://mcp.example.com"}
+            ),
+            "ok",
+        )
+
+    def test_stable_url_policy_override_allows_temporary(self):
+        os.environ[launcher.OAUTH_TEMP_URL_OVERRIDE] = "1"
+        self.assertEqual(launcher.stable_url_policy({"auth_mode": "oauth"}), "ok")
+        self.assertEqual(launcher.stable_url_policy({"auth_mode": "dual"}), "ok")
 
     def test_temporary_url_override_allows_local_experiments(self):
         os.environ[launcher.OAUTH_TEMP_URL_OVERRIDE] = "1"
