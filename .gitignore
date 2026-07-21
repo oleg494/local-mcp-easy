@@ -9,4 +9,6 @@ release/
 agent-repo-instructions.local.md
 agent-repo-config.local.json
 .venv/
+.venv-linux/
 connections.cfg
+oauth_state.json

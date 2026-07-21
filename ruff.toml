@@ -1,0 +1,6 @@
+# Lint policy for Notion Local MCP Easy.
+
+[lint.per-file-ignores]
+# Tests must extend sys.path (and sometimes set env vars) before importing
+# the project modules, so module-level imports cannot be at the very top.
+"tests/*" = ["E402"]

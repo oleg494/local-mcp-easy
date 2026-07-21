@@ -285,5 +285,139 @@ class LauncherTests(unittest.TestCase):
         )
 
 
+class OAuthLauncherTests(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop(launcher.OAUTH_TEMP_URL_OVERRIDE, None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_config_auth_mode_defaults_to_legacy(self):
+        self.assertEqual(launcher.config_auth_mode({}), "legacy")
+        self.assertEqual(launcher.config_auth_mode({"auth_mode": "DUAL"}), "dual")
+        self.assertEqual(launcher.config_auth_mode({"auth_mode": "bogus"}), "legacy")
+
+    def test_oauth_modes_require_stable_hostname(self):
+        self.assertFalse(
+            launcher.oauth_requires_stable_hostname({"auth_mode": "legacy"})
+        )
+        self.assertTrue(launcher.oauth_requires_stable_hostname({"auth_mode": "oauth"}))
+        self.assertTrue(launcher.oauth_requires_stable_hostname({"auth_mode": "dual"}))
+        self.assertFalse(
+            launcher.oauth_requires_stable_hostname(
+                {"auth_mode": "oauth", "serveo_hostname": "my-host"}
+            )
+        )
+
+    def test_temporary_url_override_allows_local_experiments(self):
+        os.environ[launcher.OAUTH_TEMP_URL_OVERRIDE] = "1"
+        self.assertFalse(
+            launcher.oauth_requires_stable_hostname({"auth_mode": "oauth"})
+        )
+
+    def test_run_blocks_oauth_mode_without_stable_hostname(self):
+        config = {"auth_mode": "oauth", "token": "t", "workspace": "w", "port": 1}
+        with mock.patch("launcher.setup", return_value=config):
+            self.assertEqual(launcher.run(), 1)
+
+    def test_oauth_setup_generates_owner_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "token": "t",
+                        "workspace": directory,
+                        "port": 8765,
+                        "serveo_hostname": "stable-host",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", config_file),
+                mock.patch("launcher.input", side_effect=["2"]),
+            ):
+                self.assertEqual(launcher.oauth_setup(), 0)
+            saved = json.loads(config_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["auth_mode"], "oauth")
+            self.assertGreaterEqual(len(saved["oauth_owner_code"]), 10)
+
+    def test_oauth_setup_keeps_current_mode_on_enter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps({"token": "t", "workspace": directory, "port": 8765}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", config_file),
+                mock.patch("launcher.input", side_effect=[""]),
+            ):
+                self.assertEqual(launcher.oauth_setup(), 0)
+            saved = json.loads(config_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["auth_mode"], "legacy")
+            self.assertNotIn("oauth_owner_code", saved)
+
+    def test_oauth_setup_keeps_existing_owner_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "token": "t",
+                        "workspace": directory,
+                        "port": 8765,
+                        "serveo_hostname": "stable-host",
+                        "auth_mode": "dual",
+                        "oauth_owner_code": "existing-owner-code",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", config_file),
+                mock.patch("launcher.input", side_effect=["3"]),
+                mock.patch("launcher.yes_no", side_effect=[False]),
+            ):
+                self.assertEqual(launcher.oauth_setup(), 0)
+            saved = json.loads(config_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["oauth_owner_code"], "existing-owner-code")
+
+    def test_show_connection_masks_owner_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_file = root / "config.json"
+            connection_file = root / "connection.txt"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "token": "super-secret-token-value",
+                        "oauth_owner_code": "owner-code-secret-value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            connection_file.write_text(
+                "URL: https://x/mcp\n"
+                "Bearer token: super-secret-token-value\n"
+                "OAuth owner code: owner-code-secret-value\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", config_file),
+                mock.patch.object(launcher, "CONNECTION_FILE", connection_file),
+                mock.patch("builtins.print") as fake_print,
+            ):
+                self.assertEqual(launcher.show_connection(full=False), 0)
+            output = "\n".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
+            self.assertNotIn("super-secret-token-value", output)
+            self.assertNotIn("owner-code-secret-value", output)
+            self.assertIn("supe...alue", output)
+            self.assertIn("owne...alue", output)
+
+
 if __name__ == "__main__":
     unittest.main()

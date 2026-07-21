@@ -1,6 +1,57 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 — 2026-07-21 (Universal OAuth)
+
+### Universal auth modes
+
+- Added `AUTH_MODE = legacy | oauth | dual`. `legacy` keeps the exact 1.4.x
+  behaviour (static Bearer token, Notion); `oauth` serves OAuth 2.1 clients
+  such as Hyperagent; `dual` accepts both on the same `/mcp` endpoint.
+- Built an embedded OAuth 2.1 Authorization Server on the official `mcp` SDK
+  auth machinery (`/authorize`, `/token`, `/register`, `/revoke`): Dynamic
+  Client Registration, PKCE `S256` only, exact `redirect_uri` matching,
+  `state` round-trip, short-lived access tokens, rotating refresh tokens and
+  authorization-code replay revocation.
+- Added OAuth discovery: RFC 8414 Authorization Server Metadata, RFC 9728
+  Protected Resource Metadata (path-aware `/.well-known/oauth-protected-resource/mcp`
+  plus a root alias), and `WWW-Authenticate` with `resource_metadata` on 401.
+- Access tokens are audience-bound to this server's `/mcp` resource URL
+  (RFC 8707); tokens minted for another URL are rejected.
+- New `/consent` page: every authorization request must be approved with the
+  OAuth owner code, so open Dynamic Client Registration cannot grant access
+  to anyone who merely knows the public URL. Wrong codes are rate-limited
+  with a lockout.
+- Introduced per-tool OAuth scopes with deny-by-default:
+  `mcp:files:read`, `mcp:files:write`, `mcp:commands:run`, `mcp:git`.
+  A read-only token cannot write files, run commands or touch git. The
+  legacy master token keeps full access and is documented as such.
+- OAuth state (registered clients and SHA-256 hashes of tokens — never raw
+  token values) lives in `%LOCALAPPDATA%\NotionMcpEasy\oauth_state.json`,
+  outside the repository and release archives. Registered clients and
+  refresh/access tokens survive server restarts on a stable hostname, so
+  OAuth clients reconnect without re-approval.
+- Launcher: new `OAUTH_SETUP.bat` (`launcher.py --oauth`) wizard for choosing
+  the auth mode and generating the owner code, and
+  `REGISTER_OAUTH_CLIENT.bat` (`launcher.py --register-oauth-client`) for
+  pre-registered "Bring my own OAuth app" clients (public PKCE or
+  confidential).
+- The launcher refuses to start `oauth`/`dual` mode on a temporary tunnel
+  URL: OAuth needs a reserved Serveo hostname (issuer, metadata, redirect
+  configuration and token audience all break when the URL changes).
+  `MCP_OAUTH_ALLOW_TEMPORARY_URL=1` remains as an explicit local-testing
+  override.
+- `SHOW_CONNECTION.bat` masks both the Bearer token and the OAuth owner
+  code; `--full` reveals them.
+- `/health` now accepts the operator (legacy) token in every mode so the
+  launcher health checks keep working even when `/mcp` is OAuth-only. In
+  `dual` mode legacy clients may keep sending `X-API-Key`.
+- Added 47 new tests: provider/store unit tests (hashing, rotation, replay
+  revocation, audience checks, persistence), consent-page tests (CSRF,
+  lockout, deny), full end-to-end OAuth and dual-mode integration tests
+  against a live server process, and launcher policy tests. Full suite:
+  105 tests.
+
+### Maintenance (previously unreleased)
 
 - Blocked multi-ref and destructive push modes that bypass branch policy (`--all`, `--mirror`, `--tags`, `--delete`, and `--prune`).
 - Validate Git's effective push remote when `git push` omits the remote argument.

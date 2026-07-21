@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-from itertools import islice
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -24,10 +23,30 @@ from core import (
     safe_path,
     should_skip,
 )
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+
+from auth import (
+    ALL_SCOPES,
+    AUTH_MODE_DUAL,
+    AUTH_MODE_LEGACY,
+    AUTH_MODE_OAUTH,
+    ConsentHandler,
+    LegacyTokenVerifier,
+    LocalOAuthProvider,
+    OAuthStore,
+    SCOPE_COMMANDS_RUN,
+    SCOPE_FILES_READ,
+    SCOPE_FILES_WRITE,
+    SCOPE_GIT,
+    build_auth_settings,
+    parse_auth_mode,
+    protected_resource_document,
+    resource_url_for,
+)
 
 TOKEN = os.environ.get("MCP_TOKEN", "").strip()
 BASE_DIR = Path(os.environ.get("MCP_BASE_DIR", str(Path.home() / "Documents"))).resolve()
@@ -62,8 +81,66 @@ if not TOKEN:
 if not BASE_DIR.is_dir():
     raise RuntimeError(f"MCP_BASE_DIR does not exist: {BASE_DIR}")
 
+SERVER_NAME = "Notion Local MCP Easy"
+SERVER_VERSION = (SERVER_DIR / "VERSION").read_text(encoding="utf-8").strip() \
+    if (SERVER_DIR / "VERSION").is_file() else "dev"
+
+# --- Universal auth configuration (legacy | oauth | dual) -------------------
+try:
+    AUTH_MODE = parse_auth_mode(os.environ.get("MCP_AUTH_MODE"))
+except ValueError as exc:
+    raise RuntimeError(str(exc)) from exc
+OAUTH_ENABLED = AUTH_MODE in (AUTH_MODE_OAUTH, AUTH_MODE_DUAL)
+
+OWNER_CODE = os.environ.get("MCP_OAUTH_OWNER_CODE", "").strip()
+_default_public_url = (
+    f"https://{STABLE_HOSTNAME}{SERVEO_SUFFIX}"
+    if STABLE_HOSTNAME
+    else f"http://127.0.0.1:{PORT}"
+)
+PUBLIC_URL = (os.environ.get("MCP_PUBLIC_URL", "").strip() or _default_public_url).rstrip("/")
+PUBLIC_HOST = (urlsplit(PUBLIC_URL).hostname or "").lower()
+OAUTH_STATE_DIR = Path(
+    os.environ.get("MCP_OAUTH_STATE_DIR", "").strip()
+    or Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NotionMcpEasy"
+)
+OAUTH_ACCESS_TTL = int(os.environ.get("MCP_OAUTH_ACCESS_TTL", "3600"))
+OAUTH_REFRESH_TTL = int(os.environ.get("MCP_OAUTH_REFRESH_TTL", str(30 * 24 * 3600)))
+OAUTH_CONSENT_MAX_ATTEMPTS = int(os.environ.get("MCP_OAUTH_CONSENT_MAX_ATTEMPTS", "5"))
+OAUTH_CONSENT_LOCKOUT = int(os.environ.get("MCP_OAUTH_CONSENT_LOCKOUT_SECONDS", "900"))
+
+if OAUTH_ENABLED:
+    if not OWNER_CODE:
+        raise RuntimeError(
+            "MCP_OAUTH_OWNER_CODE is required in oauth/dual mode. "
+            "Run OAUTH_SETUP.bat (launcher.py --oauth) to configure it."
+        )
+    _is_local_issuer = PUBLIC_HOST in {"127.0.0.1", "localhost"}
+    if not PUBLIC_URL.startswith("https://") and not _is_local_issuer:
+        raise RuntimeError(
+            "OAuth requires a stable https public URL (or 127.0.0.1 for local "
+            f"testing); got: {PUBLIC_URL}"
+        )
+
+oauth_provider: LocalOAuthProvider | None = None
+_fastmcp_auth_kwargs = {}
+if OAUTH_ENABLED:
+    _legacy_verifier = LegacyTokenVerifier(TOKEN) if AUTH_MODE == AUTH_MODE_DUAL else None
+    oauth_provider = LocalOAuthProvider(
+        store=OAuthStore(OAUTH_STATE_DIR / "oauth_state.json"),
+        issuer_url=PUBLIC_URL,
+        canonical_resource=resource_url_for(PUBLIC_URL),
+        legacy_verifier=_legacy_verifier,
+        access_ttl=OAUTH_ACCESS_TTL,
+        refresh_ttl=OAUTH_REFRESH_TTL,
+    )
+    _fastmcp_auth_kwargs = {
+        "auth": build_auth_settings(PUBLIC_URL, SERVER_NAME),
+        "auth_server_provider": oauth_provider,
+    }
+
 mcp = FastMCP(
-    "Notion Local MCP Easy",
+    SERVER_NAME,
     host="127.0.0.1",
     port=PORT,
     stateless_http=True,
@@ -72,6 +149,7 @@ mcp = FastMCP(
     # Serveo, so it is disabled and replaced by the Host check inside
     # SecurityMiddleware (localhost + *.serveousercontent.com).
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    **_fastmcp_auth_kwargs,
 )
 
 def _clip(text) -> str:
@@ -89,11 +167,38 @@ def _clip(text) -> str:
     return text
 
 
-def tool():
-    """Like @tool() but clips every result through _clip()."""
+def _require_scope(scope: str) -> None:
+    """Deny-by-default OAuth scope check for the current request.
+
+    In legacy mode the SecurityMiddleware already authenticated the master
+    token, which has always granted full access — behaviour is unchanged.
+    In oauth/dual mode every request carries an AccessToken (the SDK's
+    RequireAuthMiddleware rejects anonymous requests before tools run), and
+    the token must include the scope the tool was registered with.
+    """
+    if AUTH_MODE == AUTH_MODE_LEGACY:
+        return
+    access = get_access_token()
+    if access is None:
+        raise PermissionError(
+            "Authentication context is missing; the request was not authorized."
+        )
+    if scope not in access.scopes:
+        raise PermissionError(
+            f"Access denied: this operation requires OAuth scope '{scope}'. "
+            f"Granted scopes: {', '.join(access.scopes) or '(none)'}."
+        )
+
+
+def tool(scope: str):
+    """Like @mcp.tool() but enforces an OAuth scope and clips every result."""
+    if scope not in ALL_SCOPES:
+        raise RuntimeError(f"Tool registered with unknown scope: {scope}")
+
     def deco(fn):
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
+            _require_scope(scope)
             return _clip(await fn(*args, **kwargs))
         return mcp.tool()(wrapper)
     return deco
@@ -1703,7 +1808,7 @@ async def _capture_process(
     return bytes(stdout_buffer), bytes(stderr_buffer), timed_out, truncated
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def workspace_info() -> str:
     """Show the allowed workspace, active mode, and git repo-context status."""
     commands = ", ".join(sorted(ALLOWED_COMMANDS)) if ALLOW_COMMANDS else "disabled"
@@ -1717,7 +1822,7 @@ async def workspace_info() -> str:
     )
 
 
-@tool()
+@tool(scope=SCOPE_GIT)
 async def repo_context_status(cwd: str = ".") -> str:
     """Show the current repo-context configuration, git detection, and next setup step."""
     workdir = _path(cwd)
@@ -1726,7 +1831,7 @@ async def repo_context_status(cwd: str = ".") -> str:
     return await asyncio.to_thread(_repo_context_summary, workdir)
 
 
-@tool()
+@tool(scope=SCOPE_GIT)
 async def inspect_git_repository(cwd: str = ".") -> str:
     """Inspect the git repository in this workspace without running any mutating git command."""
     workdir = _path(cwd)
@@ -1735,7 +1840,7 @@ async def inspect_git_repository(cwd: str = ".") -> str:
     return await asyncio.to_thread(_inspect_git_repository_text, workdir)
 
 
-@tool()
+@tool(scope=SCOPE_GIT)
 async def configure_repo_context(
     repository_url: str,
     is_fork: bool,
@@ -1799,7 +1904,7 @@ async def configure_repo_context(
     return f"Saved repo context to {config_path.relative_to(BASE_DIR)}\n\n{summary}"
 
 
-@tool()
+@tool(scope=SCOPE_GIT)
 async def setup_git_context(
     mode: str,
     repository_url: str = "",
@@ -1837,7 +1942,7 @@ async def setup_git_context(
     )
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def list_dir(
 
     path: str = ".",
@@ -1884,7 +1989,7 @@ async def list_dir(
     return _direct_or_saved_output("list-dir", "\n".join(rows) + suffix)
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def file_info(path: str) -> str:
     """Show file or directory metadata."""
     item = _path(path)
@@ -1899,7 +2004,7 @@ async def file_info(path: str) -> str:
     )
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def read_file(path: str, offset: int = 0, limit: int = 0, char_offset: int = 0) -> str:
     """Read a text file in chunks with a character budget that takes priority over line count."""
     item, is_temp_file = _resolve_read_file_path(path)
@@ -1931,7 +2036,7 @@ async def read_file(path: str, offset: int = 0, limit: int = 0, char_offset: int
 
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def write_file(path: str, content: str, overwrite: bool = True) -> str:
     """Write a UTF-8 text file inside the workspace."""
     encoded_size = len(content.encode("utf-8"))
@@ -1949,7 +2054,7 @@ async def write_file(path: str, content: str, overwrite: bool = True) -> str:
     return f"Wrote {len(content):,} characters to {item.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def append_file(path: str, content: str) -> str:
     """Append UTF-8 text while keeping the resulting file under the size limit."""
     encoded_size = len(content.encode("utf-8"))
@@ -1969,7 +2074,7 @@ async def append_file(path: str, content: str) -> str:
     return f"Appended {len(content):,} characters to {item.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def edit_file(
     path: str,
     old_string: str,
@@ -2007,7 +2112,7 @@ async def edit_file(
     return f"Replaced {count} occurrence(s) in {item.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def create_dir(path: str) -> str:
     """Create a directory and missing parents. Existing directories are accepted."""
     item = _path(path)
@@ -2015,7 +2120,7 @@ async def create_dir(path: str) -> str:
     return f"Directory ready: {item.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def delete_file(path: str) -> str:
     """Delete one file or one empty directory. Recursive deletion is unavailable."""
     item = _path(path)
@@ -2028,7 +2133,7 @@ async def delete_file(path: str) -> str:
     return f"Deleted: {item.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Copy one file inside the workspace."""
     source, target = _path(src), _path(dst)
@@ -2041,7 +2146,7 @@ async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     return f"Copied {source.relative_to(BASE_DIR)} -> {target.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_WRITE)
 async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Move or rename one file inside the workspace."""
     source, target = _path(src), _path(dst)
@@ -2054,7 +2159,7 @@ async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     return f"Moved {source.relative_to(BASE_DIR)} -> {target.relative_to(BASE_DIR)}"
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> str:
     """Find workspace files using a glob such as **/*.py."""
     root = _path(path)
@@ -2070,7 +2175,7 @@ async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> s
     return "\n".join(sorted(rows)) if rows else "No files matched."
 
 
-@tool()
+@tool(scope=SCOPE_FILES_READ)
 async def grep_files(
     pattern: str,
     path: str = ".",
@@ -2176,7 +2281,7 @@ async def _capture_process_to_files(
     return timed_out, truncated
 
 
-@tool()
+@tool(scope=SCOPE_COMMANDS_RUN)
 async def run_command(
     program: str,
     args: list[str] | None = None,
@@ -2262,12 +2367,16 @@ def _host_allowed(host_header: str) -> bool:
     host = host_header.split(":", 1)[0].strip().lower()
     if host in {"127.0.0.1", "localhost"}:
         return True
+    if OAUTH_ENABLED and PUBLIC_HOST and host == PUBLIC_HOST:
+        return True
     if STABLE_HOSTNAME:
         return host == f"{STABLE_HOSTNAME}{SERVEO_SUFFIX}"
     return host.endswith(SERVEO_SUFFIX)
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
+    """Legacy-mode gate: host allowlist + static master token on every route."""
+
     async def dispatch(self, request, call_next):
         if not _host_allowed(request.headers.get("host", "")):
             return JSONResponse({"error": "forbidden host"}, status_code=403)
@@ -2279,13 +2388,103 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class HostCheckMiddleware(BaseHTTPMiddleware):
+    """OAuth-mode gate: host allowlist only; auth is enforced per route.
+
+    The SDK's RequireAuthMiddleware protects /mcp, the OAuth endpoints are
+    public by design, and /health validates the operator token itself.
+    """
+
+    async def dispatch(self, request, call_next):
+        if not _host_allowed(request.headers.get("host", "")):
+            return JSONResponse({"error": "forbidden host"}, status_code=403)
+        return await call_next(request)
+
+
+class XApiKeyCompatMiddleware:
+    """dual mode: let legacy clients send the master token via X-API-Key.
+
+    The SDK BearerAuthBackend reads only the Authorization header, so the
+    X-API-Key value is mirrored into it when Authorization is absent.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = list(scope.get("headers", []))
+            has_auth = any(name == b"authorization" for name, _ in headers)
+            api_key = next(
+                (value for name, value in headers if name == b"x-api-key"), b""
+            )
+            if not has_auth and api_key:
+                headers.append((b"authorization", b"Bearer " + api_key))
+                scope = dict(scope)
+                scope["headers"] = headers
+        await self.app(scope, receive, send)
+
+
+if OAUTH_ENABLED:
+    assert oauth_provider is not None
+    _consent_handler = ConsentHandler(
+        provider=oauth_provider,
+        owner_code=OWNER_CODE,
+        server_name=SERVER_NAME,
+        server_version=SERVER_VERSION,
+        max_attempts=OAUTH_CONSENT_MAX_ATTEMPTS,
+        lockout_seconds=OAUTH_CONSENT_LOCKOUT,
+    )
+
+    @mcp.custom_route("/consent", methods=["GET", "POST"])
+    async def consent_route(request):
+        return await _consent_handler.handle(request)
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_route(request):
+        # Operator endpoint for the launcher: accepts the master token in
+        # every mode, even when /mcp itself is OAuth-only.
+        incoming = _extract_token(request)
+        if not incoming or not hmac.compare_digest(incoming, TOKEN):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return JSONResponse({"status": "ok"})
+
+    @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET", "OPTIONS"])
+    async def protected_resource_alias(request):
+        # Path-aware metadata (RFC 9728) is served by the SDK at
+        # /.well-known/oauth-protected-resource/mcp; this root alias keeps
+        # clients that still probe the older location working.
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "mcp-protocol-version",
+        }
+        if request.method == "OPTIONS":
+            return JSONResponse(None, status_code=204, headers=headers)
+        return JSONResponse(protected_resource_document(PUBLIC_URL), headers=headers)
+
+
 if __name__ == "__main__":
     import uvicorn
 
     _cleanup_temp_files()
     app = mcp.streamable_http_app()
-    app.add_middleware(SecurityMiddleware)
-    print(f"Notion Local MCP Easy: http://127.0.0.1:{PORT}/mcp")
+    if AUTH_MODE == AUTH_MODE_LEGACY:
+        app.add_middleware(SecurityMiddleware)
+    else:
+        if AUTH_MODE == AUTH_MODE_DUAL:
+            app.add_middleware(XApiKeyCompatMiddleware)
+        app.add_middleware(HostCheckMiddleware)
+    print(f"{SERVER_NAME} {SERVER_VERSION}: http://127.0.0.1:{PORT}/mcp")
     print(f"Workspace: {BASE_DIR}")
     print(f"Commands: {'trusted developer mode' if ALLOW_COMMANDS else 'file-only mode'}")
+    print(f"Auth mode: {AUTH_MODE}")
+    if OAUTH_ENABLED:
+        print(f"OAuth issuer: {PUBLIC_URL}")
+        print(f"OAuth resource: {resource_url_for(PUBLIC_URL)}")
+        print(
+            "OAuth discovery: "
+            f"{PUBLIC_URL}/.well-known/oauth-authorization-server | "
+            f"{PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"
+        )
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
