@@ -873,6 +873,11 @@ def _setup_git_context_sync(
     detected_before = _detect_git_repo(cwd)
     if not detected_before["git_installed"]:
         raise ValueError("Git is not installed or not on PATH.")
+    if mode == "bind_existing_repo" and not detected_before["repo_present"]:
+        raise ValueError(
+            "No git repository exists here yet. Ask the user whether to "
+            "init_new_repo, attach_to_remote, or disable_git."
+        )
 
     if mode == "disable_git":
         repository_url = (
@@ -1214,6 +1219,38 @@ def _push_remote_and_refspecs(args: list[str]) -> tuple[str, list[str]]:
     return positionals[0], positionals[1:]
 
 
+def _git_config_value(
+    cwd: Path, key: str, *, git_prefix: list[str] | None = None
+) -> str:
+    query = _run_git_query(cwd, "config", "--get", key, git_prefix=git_prefix)
+    if query is None or query.returncode != 0:
+        return ""
+    return query.stdout.strip()
+
+
+def _effective_push_remote(
+    cwd: Path, current_branch: str, detected: dict[str, object], git_args: list[str]
+) -> str:
+    git_prefix, _ = _split_git_global_args(git_args)
+    keys = []
+    if current_branch:
+        keys.append(f"branch.{current_branch}.pushRemote")
+    keys.append("remote.pushDefault")
+    if current_branch:
+        keys.append(f"branch.{current_branch}.remote")
+    for key in keys:
+        value = _git_config_value(cwd, key, git_prefix=git_prefix)
+        if value and value != ".":
+            return value
+    remotes = detected.get("remotes", {})
+    return "origin" if isinstance(remotes, dict) and "origin" in remotes else ""
+
+
+def _blocked_push_mode(args: list[str]) -> str:
+    blocked = {"--all", "--mirror", "--tags", "--delete", "-d", "--prune"}
+    return next((arg for arg in args if arg in blocked), "")
+
+
 def _pull_remote_and_branch(args: list[str]) -> tuple[str, str]:
     positionals = _command_positionals(args, {"--rebase-merges", "--strategy", "--strategy-option"})
     remote = positionals[0] if positionals else ""
@@ -1353,7 +1390,21 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
 
     if subcommand == "push":
         _require_current_branch_matches(current_branch, target_branch)
+        blocked_mode = _blocked_push_mode(tail)
+        if blocked_mode:
+            raise ValueError(
+                f"Git is blocked because git push {blocked_mode} can update or delete "
+                "multiple refs outside the configured branch policy."
+            )
         remote_target, refspecs = _push_remote_and_refspecs(tail)
+        if not remote_target:
+            remote_target = _effective_push_remote(
+                cwd, current_branch, detected, git_args
+            )
+        if not remote_target:
+            raise ValueError(
+                "Git is blocked because the effective push remote could not be determined safely."
+            )
         _ensure_remote_reference_allowed(remote_target, config, detected, context="git push")
         for refspec in refspecs:
             ref_target = _refspec_target_branch(refspec, current_branch)

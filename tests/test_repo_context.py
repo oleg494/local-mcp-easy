@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 PROJECT = Path(__file__).resolve().parents[1]
 
 
@@ -177,7 +176,7 @@ class RepoContextTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError) as caught:
                 server._ensure_git_context_for_command(workspace, ["commit", "-m", "test"])
-            self.assertIn("configured to commit on stablefix", str(caught.exception))
+            self.assertIn("configured to work on stablefix", str(caught.exception))
 
     @unittest.skipUnless(shutil.which("git"), "git is required for repo-context git tests")
     def test_mutating_git_commands_respect_repo_policy(self):
@@ -204,6 +203,50 @@ class RepoContextTests(unittest.TestCase):
             for args in (["reset", "--hard"], ["checkout", "-B", "other"], ["config", "user.name", "oops"]):
                 with self.assertRaises(ValueError):
                     server._ensure_git_context_for_command(workspace, list(args))
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for repo-context git tests")
+    def test_push_multi_ref_modes_are_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"], cwd=workspace, check=True, capture_output=True)
+            server = load_server(workspace)
+            server._save_repo_context(
+                cwd=workspace, status="configured",
+                repository_url="https://github.com/example/project.git",
+                is_fork=False, upstream_url="", default_branch="main",
+                branch_mode="default_branch", commit_branch="", git_enabled=True,
+                disabled_reason="", last_detected_origin="https://github.com/example/project.git",
+                last_detected_branch="main",
+            )
+            for args in (["push", "--all", "origin"], ["push", "--mirror", "origin"], ["push", "--tags", "origin"], ["push", "--delete", "origin", "main"]):
+                with self.subTest(args=args), self.assertRaises(ValueError):
+                    server._ensure_git_context_for_command(workspace, list(args))
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for repo-context git tests")
+    def test_push_without_remote_validates_effective_branch_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "evil", "https://github.com/example/other.git"], cwd=workspace, check=True, capture_output=True)
+            subprocess.run(["git", "config", "branch.main.remote", "evil"], cwd=workspace, check=True, capture_output=True)
+            server = load_server(workspace)
+            server._save_repo_context(
+                cwd=workspace, status="configured",
+                repository_url="https://github.com/example/project.git",
+                is_fork=False, upstream_url="", default_branch="main",
+                branch_mode="default_branch", commit_branch="", git_enabled=True,
+                disabled_reason="", last_detected_origin="https://github.com/example/project.git",
+                last_detected_branch="main",
+            )
+            with self.assertRaises(ValueError) as caught:
+                server._ensure_git_context_for_command(workspace, ["push"])
+            self.assertIn("outside the approved repo context", str(caught.exception))
+            subprocess.run(["git", "config", "branch.main.remote", "origin"], cwd=workspace, check=True, capture_output=True)
+            server._ensure_git_context_for_command(workspace, ["push"])
 
     @unittest.skipUnless(shutil.which("git"), "git is required for repo-context git tests")
     def test_git_dash_c_target_repo_is_checked(self):

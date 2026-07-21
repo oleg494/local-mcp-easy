@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -26,7 +27,9 @@ CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 RUNTIME_FILE = CONFIG_DIR / "runtime.json"
 CONNECTION_FILE = CONFIG_DIR / "connection.txt"
-CONNECTIONS_FILE = SCRIPT_DIR / "connections.cfg"
+CONNECTIONS_FILE = CONFIG_DIR / "connections.cfg"
+LEGACY_CONNECTIONS_FILE = SCRIPT_DIR / "connections.cfg"
+CONNECTIONS_TEMPLATE_FILE = SCRIPT_DIR / "connections.example.cfg"
 SERVER_LOG = CONFIG_DIR / "server.log"
 TUNNEL_LOG = CONFIG_DIR / "tunnel.log"
 URL_PATTERN = re.compile(r"https://[a-zA-Z0-9.-]+\.serveousercontent\.com")
@@ -41,11 +44,26 @@ def load_json(path: Path) -> dict:
         return {}
 
 
-def save_json(path: Path, value: dict) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    handle, temp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+        raise
+
+
+def save_json(path: Path, value: dict) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def yes_no(prompt: str, default: bool) -> bool:
@@ -90,7 +108,13 @@ def connections_cfg_template(menu_on: bool, paths: dict[int, str]) -> str:
 def ensure_connections_cfg_exists() -> None:
     if CONNECTIONS_FILE.exists():
         return
-    CONNECTIONS_FILE.write_text(connections_cfg_template(True, {}), encoding="utf-8")
+    if LEGACY_CONNECTIONS_FILE.exists():
+        text = LEGACY_CONNECTIONS_FILE.read_text(encoding="utf-8", errors="replace")
+    elif CONNECTIONS_TEMPLATE_FILE.exists():
+        text = CONNECTIONS_TEMPLATE_FILE.read_text(encoding="utf-8", errors="replace")
+    else:
+        text = connections_cfg_template(True, {})
+    atomic_write_text(CONNECTIONS_FILE, text)
 
 
 def load_connections_cfg() -> dict[str, object]:
@@ -114,9 +138,7 @@ def load_connections_cfg() -> dict[str, object]:
 
 def save_connections_cfg(menu_on: bool, paths: dict[int, str]) -> None:
     ensure_connections_cfg_exists()
-    CONNECTIONS_FILE.write_text(
-        connections_cfg_template(menu_on, paths), encoding="utf-8"
-    )
+    atomic_write_text(CONNECTIONS_FILE, connections_cfg_template(menu_on, paths))
 
 
 def first_free_connection_slot(paths: dict[int, str]) -> int | None:

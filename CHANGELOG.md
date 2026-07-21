@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Blocked multi-ref and destructive push modes that bypass branch policy (`--all`, `--mirror`, `--tags`, `--delete`, and `--prune`).
+- Validate Git's effective push remote when `git push` omits the remote argument.
+- Moved user-populated `connections.cfg` to `%LOCALAPPDATA%\NotionMcpEasy`, with automatic migration from 1.4.2 release folders and atomic writes.
+- Replaced the packaged user file with `connections.example.cfg` and excluded legacy `connections.cfg` from release archives.
+- Clarified that temporary Serveo URLs still require updating the Notion connection after restart.
+
 ## 1.4.2 — 2026-07-20
 
 - Added a root-level `connections.cfg` file with documented Russian comments, `MENU = on` by default, and pre-created `PATH[1]`–`PATH[9]` workspace slots.

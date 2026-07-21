@@ -8,3 +8,5 @@ temp/
 release/
 agent-repo-instructions.local.md
 agent-repo-config.local.json
+.venv/
+connections.cfg

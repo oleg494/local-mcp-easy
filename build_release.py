@@ -7,7 +7,7 @@ RELEASE_DIR = ROOT / "release"
 OUTPUT = RELEASE_DIR / f"notion-mcp-easy-{VERSION}.zip"
 EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "temp", "release"}
 EXCLUDED_SUFFIXES = {".log", ".pyc", ".zip"}
-EXCLUDED_FILES = {"connection.txt", "runtime.json", "config.json", "agent-repo-instructions.local.md", "agent-repo-config.local.json"}
+EXCLUDED_FILES = {"connection.txt", "connections.cfg", "runtime.json", "config.json", "agent-repo-instructions.local.md", "agent-repo-config.local.json"}
 
 
 def included_files():

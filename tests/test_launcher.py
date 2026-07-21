@@ -29,6 +29,24 @@ class LauncherTests(unittest.TestCase):
             self.assertIn("PATH[1] =", text)
             self.assertIn("PATH[9] =", text)
 
+    def test_connections_cfg_migrates_from_release_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connections_file = root / "local" / "connections.cfg"
+            legacy_file = root / "release" / "connections.cfg"
+            legacy_file.parent.mkdir()
+            legacy_file.write_text("MENU = off\nPATH[1] = D:\\Work\\project\n", encoding="utf-8")
+            with (
+                mock.patch.object(launcher, "CONNECTIONS_FILE", connections_file),
+                mock.patch.object(launcher, "LEGACY_CONNECTIONS_FILE", legacy_file),
+                mock.patch.object(launcher, "CONNECTIONS_TEMPLATE_FILE", root / "missing.example.cfg"),
+            ):
+                launcher.ensure_connections_cfg_exists()
+                saved = launcher.load_connections_cfg()
+            self.assertFalse(saved["menu_on"])
+            self.assertEqual(saved["paths"][1], r"D:\Work\project")
+            self.assertTrue(connections_file.is_file())
+
     def test_setup_saves_first_workspace_to_first_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
