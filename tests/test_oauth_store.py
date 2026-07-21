@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -7,7 +8,11 @@ from urllib.parse import parse_qs, urlsplit
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-from mcp.server.auth.provider import AuthorizationParams, TokenError  # noqa: E402
+from mcp.server.auth.provider import (  # noqa: E402
+    AuthorizationParams,
+    RegistrationError,
+    TokenError,
+)
 from mcp.shared.auth import OAuthClientInformationFull  # noqa: E402
 from starlette.applications import Starlette  # noqa: E402
 from starlette.routing import Route  # noqa: E402
@@ -15,15 +20,35 @@ from starlette.testclient import TestClient  # noqa: E402
 
 from auth import (  # noqa: E402
     ALL_SCOPES,
+    DEFAULT_SCOPES,
     ConsentHandler,
     LEGACY_CLIENT_ID,
     LegacyTokenVerifier,
     LocalOAuthProvider,
     OAuthStore,
+    SCOPE_COMMANDS_RUN,
     SCOPE_FILES_READ,
+    SCOPE_GIT,
+    build_auth_settings,
     normalize_resource,
 )
 from auth.oauth import PendingAuthorization  # noqa: E402
+
+
+def dcr_client(client_id: str, issued_at, scope: str | None = None) -> OAuthClientInformationFull:
+    return OAuthClientInformationFull.model_validate(
+        {
+            "client_id": client_id,
+            "client_secret": None,
+            "client_id_issued_at": issued_at,
+            "redirect_uris": [REDIRECT],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": scope if scope is not None else " ".join(ALL_SCOPES),
+            "client_name": "DCR client",
+        }
+    )
 
 ISSUER = "https://example.serveousercontent.com"
 RESOURCE = f"{ISSUER}/mcp"
@@ -269,8 +294,9 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
             owner_code="owner-code-1",
             server_name="Test MCP",
             server_version="1.5.0",
-            max_attempts=2,
-            lockout_seconds=60,
+            max_attempts_per_txn=3,
+            failure_window_seconds=60,
+            max_failures_per_window=100,
         )
         app = Starlette(
             routes=[
@@ -317,23 +343,101 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    async def test_wrong_owner_code_then_lockout(self):
+    async def test_correct_owner_code_always_works_after_wrong_attempts(self):
+        # A DoS fix: wrong attempts must NOT lock out the legitimate owner.
         txn = await self._make_txn()
-        form = {
+        wrong = {
             "txn": txn.txn_id,
             "csrf": txn.csrf,
             "owner_code": "nope",
             "action": "approve",
         }
-        first = self.http.post("/consent", data=form)
+        first = self.http.post("/consent", data=wrong)
         self.assertEqual(first.status_code, 403)
-        second = self.http.post("/consent", data=form)
+        second = self.http.post("/consent", data=wrong)
         self.assertEqual(second.status_code, 403)
-        # max_attempts=2 reached: even the right code is now locked out.
-        locked = self.http.post(
-            "/consent", data={**form, "owner_code": "owner-code-1"}
+        # The correct code still succeeds on the same transaction.
+        ok = self.http.post(
+            "/consent",
+            data={**wrong, "owner_code": "owner-code-1"},
+            follow_redirects=False,
         )
-        self.assertEqual(locked.status_code, 429)
+        self.assertEqual(ok.status_code, 302)
+        self.assertIn("code=", ok.headers["location"])
+
+    async def test_per_transaction_attempt_cap_invalidates_transaction(self):
+        txn = await self._make_txn()
+        wrong = {
+            "txn": txn.txn_id,
+            "csrf": txn.csrf,
+            "owner_code": "nope",
+            "action": "approve",
+        }
+        # max_attempts_per_txn=3: third wrong attempt burns the transaction.
+        self.assertEqual(self.http.post("/consent", data=wrong).status_code, 403)
+        self.assertEqual(self.http.post("/consent", data=wrong).status_code, 403)
+        self.assertEqual(self.http.post("/consent", data=wrong).status_code, 429)
+        # Transaction is gone; further posts (even correct) are "expired".
+        self.assertIsNone(self.provider.get_txn(txn.txn_id))
+        gone = self.http.post(
+            "/consent", data={**wrong, "owner_code": "owner-code-1"}
+        )
+        self.assertEqual(gone.status_code, 400)
+
+    async def test_global_throttle_limits_wrong_attempts_but_not_correct(self):
+        handler = ConsentHandler(
+            provider=self.provider,
+            owner_code="owner-code-1",
+            server_name="Test MCP",
+            server_version="1.5.0",
+            max_attempts_per_txn=1000,
+            failure_window_seconds=60,
+            max_failures_per_window=3,
+        )
+        app = Starlette(
+            routes=[Route("/consent", handler.handle, methods=["GET", "POST"])]
+        )
+        http = TestClient(app)
+
+        async def fresh_txn():
+            return await self._make_txn()
+
+        # Exhaust the global wrong-attempt budget across separate transactions.
+        for _ in range(3):
+            txn = await fresh_txn()
+            http.post(
+                "/consent",
+                data={
+                    "txn": txn.txn_id,
+                    "csrf": txn.csrf,
+                    "owner_code": "nope",
+                    "action": "approve",
+                },
+            )
+        throttle_txn = await fresh_txn()
+        throttled = http.post(
+            "/consent",
+            data={
+                "txn": throttle_txn.txn_id,
+                "csrf": throttle_txn.csrf,
+                "owner_code": "still-wrong",
+                "action": "approve",
+            },
+        )
+        self.assertEqual(throttled.status_code, 429)
+        # A correct code is still accepted despite the global throttle.
+        good_txn = await fresh_txn()
+        ok = http.post(
+            "/consent",
+            data={
+                "txn": good_txn.txn_id,
+                "csrf": good_txn.csrf,
+                "owner_code": "owner-code-1",
+                "action": "approve",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(ok.status_code, 302)
 
     async def test_approve_redirects_with_code(self):
         txn = await self._make_txn()
@@ -367,6 +471,170 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertIn("error=access_denied", response.headers["location"])
+
+
+class RedirectValidationTests(unittest.TestCase):
+    def _validate(self, uri: str):
+        LocalOAuthProvider.validate_redirect_uris(make_client(redirect_uris=[uri]))
+
+    def test_accepts_https_with_host_and_loopback_http(self):
+        self._validate("https://client.example/callback")
+        self._validate("http://127.0.0.1:9000/cb")
+        self._validate("http://localhost/cb")
+
+    def test_rejects_fragment(self):
+        with self.assertRaises(RegistrationError):
+            self._validate("https://client.example/cb#frag")
+
+    def test_rejects_userinfo(self):
+        with self.assertRaises(RegistrationError):
+            self._validate("https://user:pw@client.example/cb")
+
+    def test_rejects_hostless_https(self):
+        # The pydantic AnyUrl model normalizes odd forms like "https:opaque"
+        # into a hosted URL, so exercise the host check directly with a value
+        # that reaches the validator without a host.
+        from types import SimpleNamespace
+
+        with self.assertRaises(RegistrationError):
+            LocalOAuthProvider.validate_redirect_uris(
+                SimpleNamespace(redirect_uris=["https://"])
+            )
+
+    def test_rejects_non_loopback_http(self):
+        with self.assertRaises(RegistrationError):
+            self._validate("http://client.example/cb")
+
+    def test_rejects_foreign_scheme(self):
+        with self.assertRaises(RegistrationError):
+            self._validate("ftp://client.example/cb")
+
+
+class StoreResilienceTests(unittest.TestCase):
+    def _store_from(self, text: str) -> OAuthStore:
+        path = Path(tempfile.mktemp())
+        path.write_text(text, encoding="utf-8")
+        return OAuthStore(path)
+
+    def test_null_section_does_not_crash(self):
+        store = self._store_from('{"version": 1, "clients": null}')
+        self.assertEqual(store.clients, {})
+
+    def test_scalar_sections_are_ignored(self):
+        store = self._store_from('{"clients": 5, "access_tokens": "x"}')
+        self.assertEqual(store.clients, {})
+        self.assertEqual(store.access_tokens, {})
+
+    def test_non_dict_entries_are_dropped(self):
+        store = self._store_from('{"clients": {"a": {"client_id": "a"}, "b": 3}}')
+        self.assertIn("a", store.clients)
+        self.assertNotIn("b", store.clients)
+
+    def test_newer_schema_version_starts_clean(self):
+        store = self._store_from('{"version": 999, "clients": {"a": {"x": 1}}}')
+        self.assertEqual(store.clients, {})
+
+    def test_garbage_file_starts_clean(self):
+        store = self._store_from("not json at all")
+        self.assertEqual(store.clients, {})
+
+
+class ClientRegistryTests(ProviderTestBase):
+    def _provider(self, max_clients: int, unused_ttl: int = 3600) -> LocalOAuthProvider:
+        return LocalOAuthProvider(
+            store=OAuthStore(self.state_file),
+            issuer_url=ISSUER,
+            canonical_resource=RESOURCE,
+            max_clients=max_clients,
+            unused_client_ttl=unused_ttl,
+        )
+
+    async def test_registration_is_capped_by_eviction_of_unused_clients(self):
+        provider = self._provider(max_clients=2)
+        now = int(time.time())
+        await provider.register_client(dcr_client("c1", now))
+        await provider.register_client(dcr_client("c2", now + 1))
+        await provider.register_client(dcr_client("c3", now + 2))
+        # Never exceeds the cap; the oldest unused client was evicted.
+        self.assertEqual(len(provider.store.clients), 2)
+        self.assertNotIn("c1", provider.store.clients)
+        self.assertIn("c3", provider.store.clients)
+
+    async def test_token_bearing_client_is_never_evicted(self):
+        provider = self._provider(max_clients=2)
+        now = int(time.time())
+        await provider.register_client(dcr_client("keep", now))
+        # Give "keep" a live token so it must survive registration pressure.
+        provider.store.access_tokens["h"] = {
+            "client_id": "keep",
+            "scopes": [SCOPE_FILES_READ],
+            "expires_at": int(now + 10_000_000_000),
+            "resource": provider.canonical_resource,
+            "refresh_parent": "r",
+        }
+        await provider.register_client(dcr_client("c2", now + 1))
+        await provider.register_client(dcr_client("c3", now + 2))
+        self.assertIn("keep", provider.store.clients)
+
+    async def test_manual_client_without_issued_at_is_protected(self):
+        provider = self._provider(max_clients=1)
+        # Manually registered (no client_id_issued_at) BYO client.
+        manual = make_client(client_id="byo")
+        provider.store.clients["byo"] = manual.model_dump(mode="json")
+        # A DCR registration cannot evict the manual client, so it is rejected.
+        with self.assertRaises(RegistrationError):
+            await provider.register_client(dcr_client("dcr", 1_000_000))
+        self.assertIn("byo", provider.store.clients)
+
+    async def test_prune_removes_old_unused_clients(self):
+        provider = self._provider(max_clients=100, unused_ttl=3600)
+        old = 1_000  # far in the past
+        provider.store.clients["stale"] = dcr_client("stale", old).model_dump(mode="json")
+        provider.store.clients["manual"] = make_client(client_id="manual").model_dump(mode="json")
+        provider.prune_clients()
+        self.assertNotIn("stale", provider.store.clients)
+        self.assertIn("manual", provider.store.clients)
+
+
+class UsedCodeTests(ProviderTestBase):
+    async def test_used_codes_are_pruned_by_ttl(self):
+        client = make_client()
+        _, token = await self._authorize_and_exchange(client)
+        self.assertEqual(len(self.provider._used_codes), 1)
+        # Age the replay marker past its TTL and prune.
+        self.provider._used_codes = {
+            code: (entry[0], entry[1], 0.0)
+            for code, entry in self.provider._used_codes.items()
+        }
+        self.provider._prune_used_codes()
+        self.assertEqual(self.provider._used_codes, {})
+        # A late replay after pruning is handled cleanly (no crash, no token).
+        result = await self.provider.load_authorization_code(client, token.access_token)
+        self.assertIsNone(result)
+
+
+class DefaultScopeTests(unittest.TestCase):
+    def test_dcr_default_scopes_exclude_dangerous_scopes(self):
+        settings = build_auth_settings("https://x.serveousercontent.com", "Test")
+        options = settings.client_registration_options
+        self.assertEqual(set(options.valid_scopes), set(ALL_SCOPES))
+        self.assertEqual(set(options.default_scopes), set(DEFAULT_SCOPES))
+        self.assertNotIn(SCOPE_COMMANDS_RUN, options.default_scopes)
+        self.assertNotIn(SCOPE_GIT, options.default_scopes)
+
+    def test_granted_scopes_fallback_is_least_privilege(self):
+        provider = LocalOAuthProvider(
+            store=OAuthStore(Path(tempfile.mktemp())),
+            issuer_url=ISSUER,
+            canonical_resource=RESOURCE,
+        )
+        client = make_client(scope="")
+        params = make_params()
+        params.scopes = None
+        txn = PendingAuthorization(
+            txn_id="t", client=client, params=params, csrf="c"
+        )
+        self.assertEqual(set(provider.granted_scopes(txn)), set(DEFAULT_SCOPES))
 
 
 if __name__ == "__main__":

@@ -50,12 +50,34 @@ def config_auth_mode(config: dict) -> str:
     return mode if mode in AUTH_MODES else "legacy"
 
 
+def config_public_url(config: dict) -> str:
+    """Effective public base URL for OAuth.
+
+    A custom stable domain (own reverse proxy / tunnel) set via ``public_url``
+    takes precedence; otherwise the reserved Serveo hostname is used. Empty
+    string means "no stable URL configured"."""
+    custom = str(config.get("public_url", "")).strip().rstrip("/")
+    if custom:
+        return custom
+    hostname = str(config.get("serveo_hostname", "")).strip().lower()
+    if hostname:
+        return f"https://{hostname}.serveousercontent.com"
+    return ""
+
+
+def config_uses_serveo(config: dict) -> bool:
+    """Whether the launcher should manage a Serveo tunnel. A custom public_url
+    means the operator runs their own tunnel/proxy, so Serveo is skipped."""
+    return not str(config.get("public_url", "")).strip()
+
+
 def oauth_requires_stable_hostname(config: dict) -> bool:
     """OAuth metadata, redirect configuration and token audience all break
-    when the public URL changes, so oauth/dual demand a reserved hostname."""
+    when the public URL changes, so oauth/dual demand a stable URL — either a
+    reserved Serveo hostname or a custom ``public_url``."""
     if config_auth_mode(config) == "legacy":
         return False
-    if str(config.get("serveo_hostname", "")).strip():
+    if config_public_url(config):
         return False
     return os.environ.get(OAUTH_TEMP_URL_OVERRIDE, "").strip().lower() not in {
         "1",
@@ -595,6 +617,9 @@ def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
     env = os.environ.copy()
     hostname = str(config.get("serveo_hostname", "")).strip().lower()
     auth_mode = config_auth_mode(config)
+    # Prefer a custom stable domain (own proxy) over the Serveo-derived URL;
+    # this is what makes MCP_PUBLIC_URL usable through the normal launcher.
+    public_url = config_public_url(config)
     env.update(
         {
             "MCP_TOKEN": config["token"],
@@ -605,9 +630,7 @@ def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
             "MCP_SERVEO_HOSTNAME": hostname,
             "MCP_AUTH_MODE": auth_mode,
             "MCP_OAUTH_OWNER_CODE": str(config.get("oauth_owner_code", "")).strip(),
-            "MCP_PUBLIC_URL": (
-                f"https://{hostname}.serveousercontent.com" if hostname else ""
-            ),
+            "MCP_PUBLIC_URL": public_url,
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -752,7 +775,12 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
     save_json(RUNTIME_FILE, runtime)
     mode = "trusted developer" if config.get("allow_commands", False) else "file-only"
     hostname = str(config.get("serveo_hostname", "")).strip()
-    tunnel_mode = f"stable ({hostname})" if hostname else "temporary"
+    if str(config.get("public_url", "")).strip():
+        tunnel_mode = "custom stable URL (own proxy)"
+    elif hostname:
+        tunnel_mode = f"stable ({hostname})"
+    else:
+        tunnel_mode = "temporary"
     auth_mode = config_auth_mode(config)
     base_url = url.rstrip("/")
     oauth_lines = ""
@@ -798,14 +826,16 @@ def run() -> int:
     if oauth_requires_stable_hostname(config):
         mode = config_auth_mode(config)
         print(
-            f"ERROR: auth mode '{mode}' requires a reserved Serveo hostname.\n"
+            f"ERROR: auth mode '{mode}' requires a stable public URL.\n"
             "A temporary tunnel URL changes on every restart, which breaks the\n"
             "OAuth issuer, discovery metadata, redirect configuration and the\n"
             "audience of already issued tokens.\n\n"
             "Fix one of these ways:\n"
             "  1. Run SETUP.bat and configure a reserved Serveo hostname.\n"
-            "  2. Run OAUTH_SETUP.bat and switch auth mode back to 'legacy'.\n"
-            f"  3. For local experiments only: set {OAUTH_TEMP_URL_OVERRIDE}=1.",
+            "  2. Run OAUTH_SETUP.bat and set a custom stable public URL\n"
+            "     (your own domain / reverse proxy).\n"
+            "  3. Run OAUTH_SETUP.bat and switch auth mode back to 'legacy'.\n"
+            f"  4. For local experiments only: set {OAUTH_TEMP_URL_OVERRIDE}=1.",
             file=sys.stderr,
         )
         return 1
@@ -823,6 +853,27 @@ def run() -> int:
     tunnel: subprocess.Popen | None = None
     try:
         server, server_log = start_server(config)
+
+        if not config_uses_serveo(config):
+            # Custom stable domain: the operator runs their own reverse proxy or
+            # tunnel that maps public_url -> 127.0.0.1:port. start_server already
+            # verified the server is healthy on localhost, so just publish and
+            # watch the server; the launcher manages no Serveo tunnel here.
+            url = config_public_url(config)
+            publish_connection(config, url, server.pid, 0)
+            port = int(config.get("port", 8765))
+            print(
+                "Custom public URL mode: ensure your reverse proxy/tunnel routes\n"
+                f"  {url}  ->  http://127.0.0.1:{port}\n"
+                "The launcher is not starting a Serveo tunnel."
+            )
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError(
+                        f"MCP server stopped with code {server.returncode}; see {SERVER_LOG}"
+                    )
+                time.sleep(1)
+
         tunnel, lines = start_tunnel(config)
         url = resolve_tunnel_url(config, tunnel, lines)
         if not public_health_ok(url, config["token"], process=tunnel):
@@ -908,13 +959,38 @@ def oauth_setup() -> int:
     config["auth_mode"] = mode
 
     if mode in ("oauth", "dual"):
-        if not str(config.get("serveo_hostname", "")).strip():
+        existing_custom = str(config.get("public_url", "")).strip()
+        prompt = (
+            "Custom stable public URL (own domain/reverse proxy), or Enter to use "
+            "a reserved Serveo hostname"
+        )
+        prompt += f" [{existing_custom}]" if existing_custom else ""
+        raw_custom = input(f"{prompt}: ").strip().rstrip("/")
+        custom_url = raw_custom or existing_custom
+        if custom_url:
+            if not re.match(r"^https://[^/\s]+", custom_url) and not re.match(
+                r"^http://(127\.0\.0\.1|localhost)(:\d+)?", custom_url
+            ):
+                print(
+                    "Custom public URL must be https:// (or http://127.0.0.1 for "
+                    "local testing); nothing changed."
+                )
+                return 1
+            config["public_url"] = custom_url
             print(
-                "\nWARNING: OAuth needs a stable public URL. Configure a reserved\n"
-                "Serveo hostname via SETUP.bat before starting the server, or the\n"
-                "launcher will refuse to start in this mode.\n"
-                f"(Local experiments only: set {OAUTH_TEMP_URL_OVERRIDE}=1.)"
+                f"Custom public URL saved: {custom_url}\n"
+                "You are responsible for routing that URL to 127.0.0.1:port with "
+                "your own reverse proxy/tunnel; the launcher will not start Serveo."
             )
+        else:
+            config.pop("public_url", None)
+            if not str(config.get("serveo_hostname", "")).strip():
+                print(
+                    "\nWARNING: OAuth needs a stable public URL. Configure a reserved\n"
+                    "Serveo hostname via SETUP.bat (or set a custom public URL here)\n"
+                    "before starting the server, or the launcher will refuse to start.\n"
+                    f"(Local experiments only: set {OAUTH_TEMP_URL_OVERRIDE}=1.)"
+                )
         owner_code = str(config.get("oauth_owner_code", "")).strip()
         if owner_code:
             if yes_no("Generate a new OAuth owner code?", False):

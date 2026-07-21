@@ -29,9 +29,20 @@ ALL_SCOPES = (
 SCOPE_DESCRIPTIONS = {
     SCOPE_FILES_READ: "Read files and directories inside the workspace",
     SCOPE_FILES_WRITE: "Create, edit, move and delete files inside the workspace",
-    SCOPE_COMMANDS_RUN: "Run allow-listed developer commands (only in trusted developer mode)",
+    SCOPE_COMMANDS_RUN: (
+        "Run allow-listed developer commands. In trusted developer mode these "
+        "programs (Python, Git, Node, ...) run with the operating-system user's "
+        "rights and can reach files and the network OUTSIDE the workspace — treat "
+        "this as near-full system access, not a workspace-scoped permission."
+    ),
     SCOPE_GIT: "Inspect Git repositories and manage repo context files",
 }
+
+# Least-privilege default granted to clients that do not request specific
+# scopes (e.g. Dynamic Client Registration without a scope field). The
+# powerful scopes — mcp:commands:run (near-full system access) and mcp:git —
+# are intentionally excluded and must be requested explicitly.
+DEFAULT_SCOPES = (SCOPE_FILES_READ, SCOPE_FILES_WRITE)
 
 # client_id reported for requests authenticated with the static master token.
 LEGACY_CLIENT_ID = "legacy-master-token"

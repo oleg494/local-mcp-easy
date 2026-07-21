@@ -21,7 +21,7 @@ from mcp.server.auth.settings import (
 )
 from mcp.shared.auth import ProtectedResourceMetadata
 
-from .base import ALL_SCOPES
+from .base import ALL_SCOPES, DEFAULT_SCOPES
 
 
 def resource_url_for(public_url: str) -> str:
@@ -36,8 +36,11 @@ def build_auth_settings(public_url: str, resource_name: str) -> AuthSettings:
         resource_server_url=resource_url_for(issuer),
         client_registration_options=ClientRegistrationOptions(
             enabled=True,
+            # Clients MAY request any scope, but a client that registers
+            # without asking for scopes gets the least-privilege default
+            # (workspace read/write) — not command execution or git.
             valid_scopes=list(ALL_SCOPES),
-            default_scopes=list(ALL_SCOPES),
+            default_scopes=list(DEFAULT_SCOPES),
         ),
         revocation_options=RevocationOptions(enabled=True),
         # Scope enforcement is per tool (deny-by-default in server.tool());

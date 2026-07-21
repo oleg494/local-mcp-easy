@@ -43,7 +43,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from .base import ALL_SCOPES, normalize_resource, resources_match
+from .base import DEFAULT_SCOPES, normalize_resource, resources_match
 from .legacy import LegacyTokenVerifier
 
 STATE_FILE_VERSION = 1
@@ -51,6 +51,17 @@ DEFAULT_ACCESS_TTL = 3600
 DEFAULT_REFRESH_TTL = 30 * 24 * 3600
 CODE_TTL = 300
 TXN_TTL = 600
+# How long a replay marker for an exchanged authorization code is kept. A code
+# only lives CODE_TTL, so a window comfortably larger than that catches any
+# realistic replay while bounding the in-memory dict.
+USED_CODE_TTL = 3600
+# Bound the persisted client registry so open Dynamic Client Registration
+# cannot grow oauth_state.json without limit.
+DEFAULT_MAX_CLIENTS = 100
+# DCR-registered clients that never complete authorization are pruned after
+# this long. Real clients finish DCR -> authorize -> token within seconds, so
+# this both bounds storage and lets a registration flood self-heal quickly.
+DEFAULT_UNUSED_CLIENT_TTL = 3600
 
 ACCESS_PREFIX = "mcp_at_"
 REFRESH_PREFIX = "mcp_rt_"
@@ -64,6 +75,19 @@ def _now() -> float:
     return time.time()
 
 
+def _as_dict_of_dicts(value: Any) -> dict[str, Any]:
+    """Coerce a loaded JSON value into a str->dict mapping, dropping anything
+    malformed. Guards against a hand-edited or corrupted state file (e.g.
+    ``{"clients": null}`` or a stray scalar) crashing startup."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: val
+        for key, val in value.items()
+        if isinstance(key, str) and isinstance(val, dict)
+    }
+
+
 @dataclass
 class PendingAuthorization:
     """An /authorize request waiting for owner approval on /consent."""
@@ -73,6 +97,7 @@ class PendingAuthorization:
     params: AuthorizationParams
     csrf: str
     created_at: float = field(default_factory=_now)
+    attempts: int = 0
 
     def expired(self) -> bool:
         return _now() > self.created_at + TXN_TTL
@@ -100,9 +125,13 @@ class OAuthStore:
             return
         if not isinstance(raw, dict):
             return
-        self.clients = dict(raw.get("clients", {}))
-        self.access_tokens = dict(raw.get("access_tokens", {}))
-        self.refresh_tokens = dict(raw.get("refresh_tokens", {}))
+        version = raw.get("version", 0)
+        if not isinstance(version, int) or version > STATE_FILE_VERSION:
+            # Unknown or newer schema: start clean rather than misinterpret it.
+            return
+        self.clients = _as_dict_of_dicts(raw.get("clients"))
+        self.access_tokens = _as_dict_of_dicts(raw.get("access_tokens"))
+        self.refresh_tokens = _as_dict_of_dicts(raw.get("refresh_tokens"))
         self.prune()
 
     def save(self) -> None:
@@ -151,6 +180,13 @@ def _unlink_quietly(path: str) -> None:
         pass
 
 
+def _reject_redirect(raw: str, reason: str) -> None:
+    raise RegistrationError(
+        error="invalid_redirect_uri",
+        error_description=f"invalid redirect_uri ({reason}): {raw}",
+    )
+
+
 class LocalOAuthProvider:
     """OAuthAuthorizationServerProvider backed by OAuthStore.
 
@@ -166,6 +202,8 @@ class LocalOAuthProvider:
         legacy_verifier: LegacyTokenVerifier | None = None,
         access_ttl: int = DEFAULT_ACCESS_TTL,
         refresh_ttl: int = DEFAULT_REFRESH_TTL,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        unused_client_ttl: int = DEFAULT_UNUSED_CLIENT_TTL,
     ):
         self.store = store
         self.issuer_url = issuer_url.rstrip("/")
@@ -173,10 +211,12 @@ class LocalOAuthProvider:
         self.legacy_verifier = legacy_verifier
         self.access_ttl = int(access_ttl)
         self.refresh_ttl = int(refresh_ttl)
+        self.max_clients = max(1, int(max_clients))
+        self.unused_client_ttl = int(unused_client_ttl)
         self._txns: dict[str, PendingAuthorization] = {}
         self._codes: dict[str, AuthorizationCode] = {}
-        # code -> (access_hash, refresh_hash) issued for it, for replay revocation
-        self._used_codes: dict[str, tuple[str, str]] = {}
+        # code -> (access_hash, refresh_hash, created_at) for replay revocation
+        self._used_codes: dict[str, tuple[str, str, float]] = {}
 
     # ------------------------------------------------------------------
     # Client registry
@@ -186,22 +226,65 @@ class LocalOAuthProvider:
     def validate_redirect_uris(client_info: OAuthClientInformationFull) -> None:
         from urllib.parse import urlsplit
 
+        loopback = {"127.0.0.1", "localhost", "::1"}
         for uri in client_info.redirect_uris or []:
             raw = str(uri)
             parts = urlsplit(raw)
             scheme = parts.scheme.lower()
             host = (parts.hostname or "").lower()
-            if scheme == "https":
-                continue
-            if scheme == "http" and host in {"127.0.0.1", "localhost", "::1"}:
-                continue
-            raise RegistrationError(
-                error="invalid_redirect_uri",
-                error_description=(
-                    "redirect_uri must use https, or http on localhost/127.0.0.1: "
-                    f"{raw}"
-                ),
-            )
+            if scheme not in {"https", "http"}:
+                _reject_redirect(raw, "scheme must be https or http")
+            if parts.fragment:
+                _reject_redirect(raw, "must not contain a fragment")
+            if parts.username or parts.password:
+                _reject_redirect(raw, "must not contain userinfo")
+            if not host:
+                # Rejects opaque forms like "https:opaque" that have no host.
+                _reject_redirect(raw, "must include a host")
+            if scheme == "http" and host not in loopback:
+                _reject_redirect(
+                    raw, "http is only allowed on loopback (127.0.0.1/localhost/::1)"
+                )
+
+    def _client_has_tokens(self, client_id: str) -> bool:
+        for record in self.store.access_tokens.values():
+            if record.get("client_id") == client_id:
+                return True
+        for record in self.store.refresh_tokens.values():
+            if record.get("client_id") == client_id:
+                return True
+        return False
+
+    def prune_clients(self) -> None:
+        """Drop DCR clients that registered but never obtained tokens within
+        ``unused_client_ttl``. Manually registered clients (no
+        ``client_id_issued_at``) and clients with live tokens are protected."""
+        cutoff = _now() - self.unused_client_ttl
+        for client_id in list(self.store.clients):
+            record = self.store.clients.get(client_id, {})
+            issued = record.get("client_id_issued_at")
+            if (
+                isinstance(issued, (int, float))
+                and issued < cutoff
+                and not self._client_has_tokens(client_id)
+            ):
+                del self.store.clients[client_id]
+
+    def _evict_one_unused_client(self) -> bool:
+        """Make room for a new registration by dropping the oldest DCR client
+        that has no tokens. Never evicts token-bearing or manually registered
+        (``client_id_issued_at`` is None) clients."""
+        candidates = [
+            (record.get("client_id_issued_at"), client_id)
+            for client_id, record in self.store.clients.items()
+            if isinstance(record.get("client_id_issued_at"), (int, float))
+            and not self._client_has_tokens(client_id)
+        ]
+        if not candidates:
+            return False
+        candidates.sort(key=lambda item: item[0])
+        del self.store.clients[candidates[0][1]]
+        return True
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         raw = self.store.clients.get(client_id)
@@ -211,6 +294,16 @@ class LocalOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.validate_redirect_uris(client_info)
+        self.prune_clients()
+        while len(self.store.clients) >= self.max_clients:
+            if not self._evict_one_unused_client():
+                raise RegistrationError(
+                    error="invalid_client_metadata",
+                    error_description=(
+                        "client registration limit reached; remove unused clients "
+                        "or try again later"
+                    ),
+                )
         self.store.clients[client_info.client_id] = client_info.model_dump(mode="json")
         self.store.save()
 
@@ -248,15 +341,27 @@ class LocalOAuthProvider:
             key: code for key, code in self._codes.items() if code.expires_at > now
         }
 
+    def _prune_used_codes(self) -> None:
+        cutoff = _now() - USED_CODE_TTL
+        self._used_codes = {
+            code: entry
+            for code, entry in self._used_codes.items()
+            if entry[2] > cutoff
+        }
+
     def get_txn(self, txn_id: str) -> PendingAuthorization | None:
         self._prune_txns()
         return self._txns.get(txn_id)
+
+    def invalidate_txn(self, txn_id: str) -> None:
+        """Drop a pending authorization (e.g. too many wrong owner-code tries)."""
+        self._txns.pop(txn_id, None)
 
     def granted_scopes(self, txn: PendingAuthorization) -> list[str]:
         if txn.params.scopes:
             return list(txn.params.scopes)
         registered = (txn.client.scope or "").split()
-        return registered or list(ALL_SCOPES)
+        return registered or list(DEFAULT_SCOPES)
 
     def approve_txn(self, txn_id: str) -> str:
         """Owner approved: mint a single-use authorization code."""
@@ -297,10 +402,11 @@ class LocalOAuthProvider:
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
+        self._prune_used_codes()
         used = self._used_codes.pop(authorization_code, None)
         if used is not None:
             # Replay of an already exchanged code: revoke what it produced.
-            access_hash, refresh_hash = used
+            access_hash, refresh_hash, _ = used
             self.store.access_tokens.pop(access_hash, None)
             self.refresh_and_children_forget(refresh_hash)
             self.store.save()
@@ -361,7 +467,7 @@ class LocalOAuthProvider:
         access_token, refresh_token, access_hash, refresh_hash = self._issue_tokens(
             client.client_id, scopes
         )
-        self._used_codes[authorization_code.code] = (access_hash, refresh_hash)
+        self._used_codes[authorization_code.code] = (access_hash, refresh_hash, _now())
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",

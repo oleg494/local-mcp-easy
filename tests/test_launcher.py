@@ -317,6 +317,53 @@ class OAuthLauncherTests(unittest.TestCase):
             launcher.oauth_requires_stable_hostname({"auth_mode": "oauth"})
         )
 
+    def test_config_public_url_prefers_custom_over_serveo(self):
+        self.assertEqual(
+            launcher.config_public_url({"serveo_hostname": "h"}),
+            "https://h.serveousercontent.com",
+        )
+        self.assertEqual(
+            launcher.config_public_url(
+                {"serveo_hostname": "h", "public_url": "https://mcp.example.com/"}
+            ),
+            "https://mcp.example.com",
+        )
+        self.assertEqual(launcher.config_public_url({}), "")
+
+    def test_custom_public_url_is_treated_as_stable(self):
+        self.assertFalse(
+            launcher.oauth_requires_stable_hostname(
+                {"auth_mode": "oauth", "public_url": "https://mcp.example.com"}
+            )
+        )
+
+    def test_custom_public_url_disables_serveo_management(self):
+        self.assertTrue(launcher.config_uses_serveo({"serveo_hostname": "h"}))
+        self.assertFalse(
+            launcher.config_uses_serveo({"public_url": "https://mcp.example.com"})
+        )
+
+    def test_oauth_setup_saves_custom_public_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps({"token": "t", "workspace": directory, "port": 8765}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(launcher, "CONFIG_FILE", config_file),
+                # mode 2 = oauth, then a custom stable public URL
+                mock.patch(
+                    "launcher.input",
+                    side_effect=["2", "https://mcp.example.com"],
+                ),
+            ):
+                self.assertEqual(launcher.oauth_setup(), 0)
+            saved = json.loads(config_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["auth_mode"], "oauth")
+            self.assertEqual(saved["public_url"], "https://mcp.example.com")
+            self.assertGreaterEqual(len(saved["oauth_owner_code"]), 10)
+
     def test_run_blocks_oauth_mode_without_stable_hostname(self):
         config = {"auth_mode": "oauth", "token": "t", "workspace": "w", "port": 1}
         with mock.patch("launcher.setup", return_value=config):
@@ -338,12 +385,14 @@ class OAuthLauncherTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(launcher, "CONFIG_FILE", config_file),
-                mock.patch("launcher.input", side_effect=["2"]),
+                # mode 2 = oauth, then Enter = keep Serveo hostname (no custom URL)
+                mock.patch("launcher.input", side_effect=["2", ""]),
             ):
                 self.assertEqual(launcher.oauth_setup(), 0)
             saved = json.loads(config_file.read_text(encoding="utf-8"))
             self.assertEqual(saved["auth_mode"], "oauth")
             self.assertGreaterEqual(len(saved["oauth_owner_code"]), 10)
+            self.assertNotIn("public_url", saved)
 
     def test_oauth_setup_keeps_current_mode_on_enter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -379,7 +428,8 @@ class OAuthLauncherTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(launcher, "CONFIG_FILE", config_file),
-                mock.patch("launcher.input", side_effect=["3"]),
+                # mode 3 = dual, then Enter = keep Serveo hostname (no custom URL)
+                mock.patch("launcher.input", side_effect=["3", ""]),
                 mock.patch("launcher.yes_no", side_effect=[False]),
             ):
                 self.assertEqual(launcher.oauth_setup(), 0)

@@ -106,8 +106,15 @@ OAUTH_STATE_DIR = Path(
 )
 OAUTH_ACCESS_TTL = int(os.environ.get("MCP_OAUTH_ACCESS_TTL", "3600"))
 OAUTH_REFRESH_TTL = int(os.environ.get("MCP_OAUTH_REFRESH_TTL", str(30 * 24 * 3600)))
+OAUTH_MAX_CLIENTS = int(os.environ.get("MCP_OAUTH_MAX_CLIENTS", "100"))
+OAUTH_UNUSED_CLIENT_TTL = int(os.environ.get("MCP_OAUTH_UNUSED_CLIENT_TTL", "3600"))
 OAUTH_CONSENT_MAX_ATTEMPTS = int(os.environ.get("MCP_OAUTH_CONSENT_MAX_ATTEMPTS", "5"))
-OAUTH_CONSENT_LOCKOUT = int(os.environ.get("MCP_OAUTH_CONSENT_LOCKOUT_SECONDS", "900"))
+OAUTH_CONSENT_FAILURE_WINDOW = int(
+    os.environ.get("MCP_OAUTH_CONSENT_FAILURE_WINDOW_SECONDS", "60")
+)
+OAUTH_CONSENT_MAX_FAILURES = int(
+    os.environ.get("MCP_OAUTH_CONSENT_MAX_FAILURES", "10")
+)
 
 if OAUTH_ENABLED:
     if not OWNER_CODE:
@@ -133,6 +140,8 @@ if OAUTH_ENABLED:
         legacy_verifier=_legacy_verifier,
         access_ttl=OAUTH_ACCESS_TTL,
         refresh_ttl=OAUTH_REFRESH_TTL,
+        max_clients=OAUTH_MAX_CLIENTS,
+        unused_client_ttl=OAUTH_UNUSED_CLIENT_TTL,
     )
     _fastmcp_auth_kwargs = {
         "auth": build_auth_settings(PUBLIC_URL, SERVER_NAME),
@@ -2432,8 +2441,9 @@ if OAUTH_ENABLED:
         owner_code=OWNER_CODE,
         server_name=SERVER_NAME,
         server_version=SERVER_VERSION,
-        max_attempts=OAUTH_CONSENT_MAX_ATTEMPTS,
-        lockout_seconds=OAUTH_CONSENT_LOCKOUT,
+        max_attempts_per_txn=OAUTH_CONSENT_MAX_ATTEMPTS,
+        failure_window_seconds=OAUTH_CONSENT_FAILURE_WINDOW,
+        max_failures_per_window=OAUTH_CONSENT_MAX_FAILURES,
     )
 
     @mcp.custom_route("/consent", methods=["GET", "POST"])

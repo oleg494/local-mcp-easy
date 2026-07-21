@@ -51,6 +51,38 @@
   against a live server process, and launcher policy tests. Full suite:
   105 tests.
 
+### Security review hardening
+
+- Consent brute-force protection is now asymmetric: a CORRECT owner code is
+  always honoured, so wrong attempts can no longer lock the legitimate owner
+  out. Wrong attempts are capped per authorization transaction and
+  rate-limited by a short, self-healing rolling window instead of a blanket
+  15-minute lockout of the whole consent handler.
+- Dynamic Client Registration can no longer grow `oauth_state.json` without
+  bound: the client registry is capped (`MCP_OAUTH_MAX_CLIENTS`, default 100),
+  registered-but-unused DCR clients are pruned after
+  `MCP_OAUTH_UNUSED_CLIENT_TTL` (default 1 h), and clients holding live tokens
+  or manually pre-registered (BYO) clients are never evicted.
+- Least-privilege default scopes: a client that registers without asking for
+  scopes now receives only `mcp:files:read` + `mcp:files:write`.
+  `mcp:commands:run` (near-full system access in trusted developer mode) and
+  `mcp:git` must be requested explicitly. `mcp:commands:run` is documented as
+  a near-full system-access grant, not a workspace-scoped one.
+- Stricter redirect_uri validation at registration: fragments, userinfo and
+  hostless/opaque forms are rejected; http is accepted only on loopback.
+- `oauth_state.json` loading is resilient to a corrupted or hand-edited file
+  (null/scalar sections, non-dict entries, unknown newer schema version) and
+  starts clean instead of crashing on startup.
+- Replay markers for exchanged authorization codes (`_used_codes`) now expire
+  (`USED_CODE_TTL`, 1 h) so long-running servers do not accumulate them.
+- `MCP_PUBLIC_URL` / a custom stable domain now works through the normal
+  launcher: `OAUTH_SETUP.bat` accepts a custom public URL, the launcher treats
+  it as a stable URL, skips Serveo tunnel management (operator runs their own
+  reverse proxy) and no longer overwrites it.
+- Release note: the distributable is the audited `build_release.py` archive
+  (`release/notion-mcp-easy-<version>.zip`), never the working directory —
+  the working directory's `.git` must not be shipped.
+
 ### Maintenance (previously unreleased)
 
 - Blocked multi-ref and destructive push modes that bypass branch policy (`--all`, `--mirror`, `--tags`, `--delete`, and `--prune`).

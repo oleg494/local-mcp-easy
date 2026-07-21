@@ -7,9 +7,13 @@ only on the local machine). Without that code nobody who merely knows the
 public tunnel URL can obtain a token, even though Dynamic Client
 Registration is open as required by the MCP specification.
 
-Protections: constant-time owner-code comparison, per-process lockout after
-repeated failures, single-use CSRF token bound to the transaction, no-store
-and anti-framing headers, and the owner code is never echoed back.
+Protections: constant-time owner-code comparison; single-use CSRF token bound
+to the transaction; no-store and anti-framing headers; the owner code is never
+echoed back. Brute-force throttling is deliberately asymmetric — a CORRECT
+owner code is always honoured, so wrong-attempt limits can never be used to
+lock the legitimate owner out (a denial-of-service on the real owner). Wrong
+attempts are capped per authorization transaction and rate-limited globally
+with a short self-healing rolling window.
 """
 from __future__ import annotations
 
@@ -23,8 +27,9 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from .base import SCOPE_DESCRIPTIONS
 from .oauth import LocalOAuthProvider, PendingAuthorization
 
-DEFAULT_MAX_ATTEMPTS = 5
-DEFAULT_LOCKOUT_SECONDS = 15 * 60
+DEFAULT_MAX_ATTEMPTS_PER_TXN = 5
+DEFAULT_FAILURE_WINDOW_SECONDS = 60
+DEFAULT_MAX_FAILURES_PER_WINDOW = 10
 
 _PAGE_STYLE = """
   :root { color-scheme: light dark; }
@@ -69,8 +74,9 @@ class ConsentHandler:
         owner_code: str,
         server_name: str,
         server_version: str,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-        lockout_seconds: int = DEFAULT_LOCKOUT_SECONDS,
+        max_attempts_per_txn: int = DEFAULT_MAX_ATTEMPTS_PER_TXN,
+        failure_window_seconds: int = DEFAULT_FAILURE_WINDOW_SECONDS,
+        max_failures_per_window: int = DEFAULT_MAX_FAILURES_PER_WINDOW,
     ):
         if not owner_code:
             raise ValueError("OAuth owner code must not be empty")
@@ -78,26 +84,27 @@ class ConsentHandler:
         self.owner_code = owner_code
         self.server_name = server_name
         self.server_version = server_version
-        self.max_attempts = max(1, int(max_attempts))
-        self.lockout_seconds = max(1, int(lockout_seconds))
-        self.failed_attempts = 0
-        self.locked_until = 0.0
+        self.max_attempts_per_txn = max(1, int(max_attempts_per_txn))
+        self.failure_window_seconds = max(1, int(failure_window_seconds))
+        self.max_failures_per_window = max(1, int(max_failures_per_window))
+        self._recent_failures: list[float] = []
 
     # ------------------------------------------------------------------
-
-    def _locked(self) -> bool:
-        return time.time() < self.locked_until
-
-    def _register_failure(self) -> None:
-        self.failed_attempts += 1
-        if self.failed_attempts >= self.max_attempts:
-            self.locked_until = time.time() + self.lockout_seconds
-            self.failed_attempts = 0
 
     def _check_owner_code(self, candidate: str) -> bool:
         if not candidate:
             return False
         return hmac.compare_digest(candidate, self.owner_code)
+
+    def _throttled(self) -> bool:
+        """True when too many WRONG attempts happened in the rolling window.
+        Self-heals as the window slides; only ever gates wrong attempts."""
+        cutoff = time.time() - self.failure_window_seconds
+        self._recent_failures = [t for t in self._recent_failures if t > cutoff]
+        return len(self._recent_failures) >= self.max_failures_per_window
+
+    def _record_failure(self) -> None:
+        self._recent_failures.append(time.time())
 
     # ------------------------------------------------------------------
 
@@ -126,25 +133,39 @@ class ConsentHandler:
                 return self._expired_page()
             return _security_headers(RedirectResponse(target, status_code=302))
 
-        if self._locked():
+        # A correct owner code is ALWAYS honoured, before any throttling check,
+        # so wrong-attempt limits cannot lock out the legitimate owner.
+        if self._check_owner_code(str(form.get("owner_code", ""))):
+            try:
+                target = self.provider.approve_txn(txn_id)
+            except KeyError:
+                return self._expired_page()
+            return _security_headers(RedirectResponse(target, status_code=302))
+
+        # Wrong code: cap attempts on this transaction and rate-limit wrong
+        # attempts globally, without a blanket lockout of the whole handler.
+        self._record_failure()
+        txn.attempts += 1
+        if txn.attempts >= self.max_attempts_per_txn:
+            self.provider.invalidate_txn(txn_id)
             return self._form_page(
                 txn,
                 error=(
-                    "Too many failed attempts. The consent page is locked for "
-                    "a few minutes — try again later."
+                    "Too many incorrect attempts for this request. Start the "
+                    "connection again from the MCP client."
                 ),
                 status=429,
             )
-        if not self._check_owner_code(str(form.get("owner_code", ""))):
-            self._register_failure()
-            return self._form_page(txn, error="Owner code is not valid.", status=403)
-
-        self.failed_attempts = 0
-        try:
-            target = self.provider.approve_txn(txn_id)
-        except KeyError:
-            return self._expired_page()
-        return _security_headers(RedirectResponse(target, status_code=302))
+        if self._throttled():
+            return self._form_page(
+                txn,
+                error=(
+                    "Too many incorrect attempts right now. Wait a moment and "
+                    "try again."
+                ),
+                status=429,
+            )
+        return self._form_page(txn, error="Owner code is not valid.", status=403)
 
     # ------------------------------------------------------------------
 
