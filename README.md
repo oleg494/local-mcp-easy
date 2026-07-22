@@ -1,5 +1,11 @@
 # Local MCP Easy
 
+[![CI](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml/badge.svg)](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![Tests](https://img.shields.io/badge/tests-170%20passing-brightgreen.svg)
+
 Локальные файловые инструменты, команды и Git через MCP — по Streamable HTTP с OAuth 2.1.
 
 One-click MCP-сервер для Windows: агент получает безопасные инструменты для чтения, поиска и изменения файлов в выбранной рабочей папке. Отдельно включается доверенный developer-режим (Python, Git, Node) с защитным git setup-flow. Стабильный публичный адрес — через зарезервированный Serveo hostname или собственный домен.

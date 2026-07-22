@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/oleg494/local-mcp-easy/discussions
+    about: Ask questions and discuss usage here instead of opening an issue.
+  - name: Security report
+    url: https://github.com/oleg494/local-mcp-easy/blob/main/SECURITY.md
+    about: Please read the security model before reporting security issues.
