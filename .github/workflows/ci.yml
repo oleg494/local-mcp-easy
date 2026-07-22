@@ -17,6 +17,11 @@ jobs:
   test:
     name: Lint & test
     runs-on: windows-latest
+    env:
+      # The app and its tests print Cyrillic; force UTF-8 so a cp1252 console
+      # on the runner does not raise UnicodeEncodeError.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,4 +51,10 @@ jobs:
         run: python -m compileall -q server.py launcher.py core.py auth tests
 
       - name: Run tests
+        env:
+          # Use the runner's long-path temp dir (e.g. D:\a\_temp) instead of the
+          # default 8.3 short path (C:\Users\RUNNER~1\...) so Path.resolve()
+          # comparisons in SafePathTests are stable.
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: python -m unittest discover -s tests -v
