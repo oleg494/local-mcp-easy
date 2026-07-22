@@ -1744,7 +1744,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
         dir=str(path.parent), prefix=path.name + ".", suffix=".mcp-tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # newline="" disables newline translation on write: existing line
+        # endings in `content` are written byte-for-byte. Without it, Windows
+        # text mode rewrites every LF to CRLF, turning an existing CRLF (read
+        # verbatim by edit_file) into CR+CRLF and accumulating a stray CR on
+        # every subsequent edit_file call on the same file.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -2084,7 +2089,7 @@ async def append_file(path: str, content: str) -> str:
 
     def _append() -> None:
         item.parent.mkdir(parents=True, exist_ok=True)
-        with item.open("a", encoding="utf-8") as handle:
+        with item.open("a", encoding="utf-8", newline="") as handle:
             handle.write(content)
 
     await asyncio.to_thread(_append)

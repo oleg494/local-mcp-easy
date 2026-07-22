@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.1.1 — 2026-07-22 (Fix: CRLF corruption in edit_file/write_file)
+
+### Bug fix — data corruption (affects 1.3.0–2.1.0)
+
+- `_atomic_write_text()` (used by `write_file`, `edit_file`, the repo-context
+  writer and the chunked-output saver) opened its temp file in text mode
+  without `newline=`, i.e. `newline=None`. On Windows that blindly rewrites
+  every `\n` to `os.linesep` (`\r\n`). Because `edit_file` reads a file with
+  `read_bytes().decode()` **without** normalizing line endings, an existing
+  `\r\n` was written back as `\r\r\n`, and one extra `\r` accumulated on the
+  file on **every** `edit_file` call. The bug has existed since 1.3.0 (when
+  atomic temp-file writes were introduced) and is present in every published
+  release through 2.1.0.
+- Fix: pass `newline=""` to `os.fdopen` in `_atomic_write_text`, disabling all
+  newline translation so content is written byte-for-byte. `append_file` (its
+  own `open(..., "a")` path) received the same one-line fix for consistency.
+- Behaviour change: files written by `write_file` now keep exactly the line
+  endings of the provided content (LF stays LF) instead of being implicitly
+  converted to CRLF on Windows. The line-ending convention is now owned by the
+  tool/caller, not silently by the OS text layer.
+
+### Recovering already-corrupted files
+
+If a file was mangled by an earlier release (stray single `\r` characters),
+strip them without touching real line breaks:
+
+```python
+data = path.read_bytes()
+clean = data.replace(b"\r\n", b"\n").replace(b"\r", b"")  # normalize to LF
+path.write_bytes(clean)
+```
+
+### Tests
+
+- New `tests/test_edit_file_newlines.py`: repeated `edit_file` on a CRLF file
+  never introduces a lone `\r`; `write_file` keeps LF-only content and writes
+  mixed CRLF verbatim; `append_file` does not accumulate `\r`;
+  `_atomic_write_text` preserves CRLF. Suite is now 152 tests.
+
 ## 2.1.0 — 2026-07-22 (Smart dual default + Serveo authorize hint)
 
 ### Default auth mode is now `dual`
