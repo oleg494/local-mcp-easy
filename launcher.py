@@ -23,7 +23,9 @@ from typing import TextIO
 APP_NAME = "LocalMcpEasy"
 # Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
 LEGACY_APP_NAME = "NotionMcpEasy"
-VERSION = "2.1.0"
+_VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+VERSION = _VERSION_FILE.read_text(encoding="utf-8").strip() \
+    if _VERSION_FILE.is_file() else "dev"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"

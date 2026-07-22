@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.2.0 — 2026-07-22 (Background command jobs)
+
+### Added
+
+- Background command execution so long or parallel commands no longer depend on
+  a single synchronous HTTP request (the free Serveo tunnel drops a POST after
+  ~20–30 s). Four new tools, all gated by the same `mcp:commands:run` scope as
+  `run_command`:
+  - `start_command(program, args, cwd, timeout)` — start an allow-listed program
+    in the background and get a `job_id` back immediately.
+  - `get_command_status(job_id)` — poll status and, once finished, the full
+    output in the same format as `run_command`.
+  - `cancel_command(job_id)` — kill a running job's process tree.
+  - `list_commands()` — list tracked jobs (id, status, elapsed, command).
+- Concurrency cap (`MCP_MAX_COMMAND_JOBS`, default 4) and automatic pruning of
+  finished jobs (10-minute retention plus a hard cap on tracked jobs), with the
+  captured output files cleaned up on eviction.
+- Graceful-shutdown cleanup: still-running background jobs are cancelled and
+  their process trees killed when the server stops, so nothing is orphaned on
+  Windows.
+
+### Internal
+
+- `run_command` and the background jobs share one validation path
+  (`_prepare_command`) and one result formatter (`_format_command_result`), so
+  their allow-list / cwd / trusted-mode security posture can never drift apart.
+- New test suite `tests/test_command_jobs.py` covers security parity, the
+  concurrency cap, TTL + count pruning, the shutdown hook, and live end-to-end
+  execution.
+
 ## 2.1.1 — 2026-07-22 (Fix: CRLF corruption in edit_file/write_file)
 
 ### Bug fix — data corruption (affects 1.3.0–2.1.0)

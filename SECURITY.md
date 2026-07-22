@@ -70,6 +70,8 @@ The setup wizard can enable commands such as Python, Git and Node. This mode is 
 
 **`run_command` with an interpreter is arbitrary code execution.** Once an interpreter such as `python` or `node` is on the allow-list, a client with the `mcp:commands:run` scope can run arbitrary code — reading and writing files anywhere the OS user can, reaching the network, and spawning processes — regardless of the workspace path sandbox and independent of the `mcp:files:*` scopes. The workspace/`safe_path` boundary only constrains the built-in file tools, not code executed by an interpreter. Grant `mcp:commands:run` only to fully trusted clients, and treat the command allow-list itself as a privileged setting.
 
+**Background command jobs carry the same trust as `run_command`.** The `start_command` / `get_command_status` / `cancel_command` / `list_commands` tools require the same `mcp:commands:run` scope and go through the same validation path (`_prepare_command`: allow-list, `cwd` check, git-context guard), so a background job is arbitrary code execution in exactly the same way. A job keeps running after the request that started it returns, but it is still bounded by its `timeout`, is cancelled (process tree killed) on server shutdown, and never escapes the command allow-list.
+
 ## Tunnel
 
 Serveo is a third-party SSH tunnel. The public URL and Bearer token must be treated as secrets. Anonymous Serveo URLs are temporary. A reserved hostname authenticated with a dedicated SSH key keeps the URL stable; the private SSH key must never be shared or included in an archive.

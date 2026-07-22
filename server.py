@@ -9,10 +9,13 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from core import (
@@ -2303,6 +2306,68 @@ async def _capture_process_to_files(
     return timed_out, truncated
 
 
+async def _prepare_command(
+    program: str, args: list[str] | None, cwd: str
+) -> tuple[str, Path]:
+    """Shared validation for run_command / start_command: enforce trusted mode,
+    resolve the program against the allowlist, validate cwd, and apply the git
+    context guard. Both the synchronous and background command paths MUST go
+    through this so their security posture can never drift apart."""
+    if not ALLOW_COMMANDS:
+        raise ValueError(
+            "Command execution is disabled. Re-run SETUP.bat to enable trusted developer mode."
+        )
+    executable = resolve_program(BASE_DIR, program, ALLOWED_COMMANDS)
+    workdir = _path(cwd)
+    if not workdir.is_dir():
+        raise ValueError(f"cwd is not a directory: {cwd}")
+    if normalized_program_name(program) == "git":
+        await asyncio.to_thread(_ensure_git_context_for_command, workdir, list(args or []))
+    return executable, workdir
+
+
+async def _spawn_process(
+    executable: str, args: list[str] | None, workdir: Path
+) -> asyncio.subprocess.Process:
+    flags = 0x00000200 if os.name == "nt" else 0
+    return await asyncio.create_subprocess_exec(
+        executable,
+        *(args or []),
+        cwd=str(workdir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=flags,
+    )
+
+
+def _format_command_result(
+    returncode: int | None,
+    stdout_text: str,
+    stderr_text: str,
+    timed_out: bool,
+    truncated: bool,
+    seconds: int,
+) -> str:
+    stdout_text = stdout_text if stdout_text != "" else "(empty result)"
+    stderr_text = stderr_text if stderr_text != "" else "(empty result)"
+    prefix_parts: list[str] = []
+    if timed_out:
+        prefix_parts.append(f"Timed out after {seconds}s (process tree stopped).")
+    if truncated:
+        prefix_parts.append(
+            f"Output truncated after reaching the safe combined limit of {MAX_COMMAND_OUTPUT:,} bytes."
+        )
+    prefix = "\n".join(prefix_parts)
+    if prefix:
+        prefix += "\n"
+    return (
+        prefix
+        + f"exit code: {returncode}\n"
+        + f"--- stdout ---\n{stdout_text}\n"
+        + f"--- stderr ---\n{stderr_text}"
+    )
+
+
 @tool(scope=SCOPE_COMMANDS_RUN)
 async def run_command(
     program: str,
@@ -2315,32 +2380,15 @@ async def run_command(
     Short output is returned directly. Long output is saved to a file and returned
     through the same chunked reading model as read_file().
     """
-    if not ALLOW_COMMANDS:
-        raise ValueError(
-            "Command execution is disabled. Re-run SETUP.bat to enable trusted developer mode."
-        )
-    executable = resolve_program(BASE_DIR, program, ALLOWED_COMMANDS)
-    workdir = _path(cwd)
-    if not workdir.is_dir():
-        raise ValueError(f"cwd is not a directory: {cwd}")
-    if normalized_program_name(program) == "git":
-        await asyncio.to_thread(_ensure_git_context_for_command, workdir, list(args or []))
+    executable, workdir = await _prepare_command(program, args, cwd)
 
     seconds = max(1, min(timeout, 300))
-    flags = 0x00000200 if os.name == "nt" else 0
 
     stdout_capture = _tool_output_path("run-command-stdout")
     stderr_capture = _tool_output_path("run-command-stderr")
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            executable,
-            *(args or []),
-            cwd=str(workdir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=flags,
-        )
+        proc = await _spawn_process(executable, args, workdir)
         timed_out, truncated = await _capture_process_to_files(
             proc,
             stdout_capture,
@@ -2350,25 +2398,9 @@ async def run_command(
 
         stdout_text = await asyncio.to_thread(_read_text_with_replace, stdout_capture)
         stderr_text = await asyncio.to_thread(_read_text_with_replace, stderr_capture)
-        stdout_text = stdout_text if stdout_text != "" else "(empty result)"
-        stderr_text = stderr_text if stderr_text != "" else "(empty result)"
 
-        prefix_parts: list[str] = []
-        if timed_out:
-            prefix_parts.append(f"Timed out after {seconds}s (process tree stopped).")
-        if truncated:
-            prefix_parts.append(
-                f"Output truncated after reaching the safe combined limit of {MAX_COMMAND_OUTPUT:,} bytes."
-            )
-        prefix = "\n".join(prefix_parts)
-        if prefix:
-            prefix += "\n"
-
-        result = (
-            prefix
-            + f"exit code: {proc.returncode}\n"
-            + f"--- stdout ---\n{stdout_text}\n"
-            + f"--- stderr ---\n{stderr_text}"
+        result = _format_command_result(
+            proc.returncode, stdout_text, stderr_text, timed_out, truncated, seconds
         )
         return _direct_or_saved_output("run-command", result)
     finally:
@@ -2376,6 +2408,277 @@ async def run_command(
             stdout_capture.unlink()
         with contextlib.suppress(OSError):
             stderr_capture.unlink()
+
+
+# --------------------------------------------------------------------------
+# Background command jobs (v2.2)
+#
+# start_command runs an allow-listed program in the background and returns a
+# job_id immediately, so a client can poll get_command_status instead of
+# holding one long HTTP request open (the free Serveo tunnel caps a single
+# request at ~20-30s) and can run several commands truly in parallel. All the
+# heavy lifting -- streamed capture with the MAX_COMMAND_OUTPUT limit, the
+# timeout-vs-limit race, and the process-tree kill -- is reused from
+# run_command's primitives; this layer is only bookkeeping (registry, limits,
+# pruning, shutdown cleanup).
+# --------------------------------------------------------------------------
+
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MCP_MAX_COMMAND_JOBS", "4") or "4"))
+MAX_TRACKED_JOBS = 50
+JOB_RETENTION_SECONDS = 600
+
+_TERMINAL_JOB_STATES = {"done", "timeout", "cancelled", "error"}
+
+
+@dataclass
+class CommandJob:
+    job_id: str
+    program: str
+    args: list[str]
+    cwd: str
+    executable: str
+    workdir: str
+    seconds: int
+    stdout_path: Path
+    stderr_path: Path
+    created_at: float
+    finished_at: float | None = None
+    status: Literal["running", "done", "timeout", "cancelled", "error"] = "running"
+    exit_code: int | None = None
+    timed_out: bool = False
+    truncated: bool = False
+    error: str | None = None
+    proc: asyncio.subprocess.Process | None = None
+    task: asyncio.Task | None = None
+
+
+_JOBS: dict[str, CommandJob] = {}
+
+
+def _now() -> float:
+    return dt.datetime.now().timestamp()
+
+
+def _job_elapsed(job: CommandJob) -> float:
+    end = job.finished_at if job.finished_at is not None else _now()
+    return max(0.0, end - job.created_at)
+
+
+def _delete_job_files(job: CommandJob) -> None:
+    for path in (job.stdout_path, job.stderr_path):
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def _prune_jobs() -> None:
+    """Opportunistic pruning (mirrors _cleanup_temp_files): drop finished jobs
+    past their retention window, then enforce a hard cap on the number of
+    tracked finished jobs (oldest first) so a burst cannot grow the registry
+    without bound even before TTL expiry."""
+    cutoff = _now() - JOB_RETENTION_SECONDS
+    expired = [
+        job_id
+        for job_id, job in _JOBS.items()
+        if job.status in _TERMINAL_JOB_STATES
+        and job.finished_at is not None
+        and job.finished_at < cutoff
+    ]
+    for job_id in expired:
+        _delete_job_files(_JOBS.pop(job_id))
+
+    finished = [job for job in _JOBS.values() if job.status in _TERMINAL_JOB_STATES]
+    if len(finished) > MAX_TRACKED_JOBS:
+        finished.sort(key=lambda job: job.finished_at or 0.0)
+        for job in finished[: len(finished) - MAX_TRACKED_JOBS]:
+            popped = _JOBS.pop(job.job_id, None)
+            if popped is not None:
+                _delete_job_files(popped)
+
+
+def _running_job_count() -> int:
+    return sum(1 for job in _JOBS.values() if job.status == "running")
+
+
+async def _run_job(job: CommandJob) -> None:
+    """Background driver: reuses _capture_process_to_files exactly as run_command
+    does, then records the terminal state. Capture files are kept for later
+    retrieval and cleaned up by _prune_jobs, not here."""
+    try:
+        proc = await _spawn_process(job.executable, job.args, Path(job.workdir))
+        job.proc = proc
+        timed_out, truncated = await _capture_process_to_files(
+            proc, job.stdout_path, job.stderr_path, job.seconds
+        )
+        job.timed_out = timed_out
+        job.truncated = truncated
+        job.exit_code = proc.returncode
+        if job.status == "cancelled":
+            pass
+        elif timed_out:
+            job.status = "timeout"
+        else:
+            job.status = "done"
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        raise
+    except Exception as exc:
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if job.finished_at is None:
+            job.finished_at = _now()
+
+
+@tool(scope=SCOPE_COMMANDS_RUN)
+async def start_command(
+    program: str,
+    args: list[str] | None = None,
+    cwd: str = ".",
+    timeout: int = 300,
+) -> str:
+    """Start an allow-listed program in the background and return a job id.
+
+    Same trusted-developer restrictions as run_command (allowlist, cwd check,
+    git-context guard). Use this for commands that may outlive a single tunnel
+    request, or to run several commands in parallel, then poll
+    get_command_status(job_id=...) to collect the result.
+    """
+    executable, workdir = await _prepare_command(program, args, cwd)
+    _prune_jobs()
+    running = _running_job_count()
+    if running >= MAX_CONCURRENT_JOBS:
+        raise ValueError(
+            f"Too many background commands running ({running}/{MAX_CONCURRENT_JOBS}). "
+            "Wait for one to finish or raise MCP_MAX_COMMAND_JOBS."
+        )
+    seconds = max(1, min(timeout, 300))
+    job_id = secrets.token_urlsafe(9)
+    job = CommandJob(
+        job_id=job_id,
+        program=program,
+        args=list(args or []),
+        cwd=cwd,
+        executable=executable,
+        workdir=str(workdir),
+        seconds=seconds,
+        stdout_path=_tool_output_path(f"job-{job_id}-stdout"),
+        stderr_path=_tool_output_path(f"job-{job_id}-stderr"),
+        created_at=_now(),
+    )
+    _JOBS[job_id] = job
+    job.task = asyncio.create_task(_run_job(job))
+    command = f"{program} {' '.join(job.args)}".rstrip()
+    return (
+        f"Started job {job_id}: {command}\n"
+        f'Poll get_command_status(job_id="{job_id}") for progress and the result.'
+    )
+
+
+@tool(scope=SCOPE_COMMANDS_RUN)
+async def get_command_status(job_id: str) -> str:
+    """Return the status, and the final output once finished, of a background job."""
+    _prune_jobs()
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"No background job {job_id!r} (unknown, or expired after "
+            f"{JOB_RETENTION_SECONDS}s). Use list_commands to see tracked jobs."
+        )
+    command = f"{job.program} {' '.join(job.args)}".rstrip()
+    if job.status == "running":
+        stdout_preview = await asyncio.to_thread(_read_text_with_replace, job.stdout_path)
+        stderr_preview = await asyncio.to_thread(_read_text_with_replace, job.stderr_path)
+        note = "(partial; output is buffered and may lag until the command finishes)"
+        body = (
+            f"job {job.job_id}: running ({_job_elapsed(job):.1f}s elapsed, "
+            f"timeout {job.seconds}s)\n"
+            f"command: {command}\n"
+            f"--- stdout so far {note} ---\n"
+            f"{stdout_preview if stdout_preview else '(empty result)'}\n"
+            f"--- stderr so far {note} ---\n"
+            f"{stderr_preview if stderr_preview else '(empty result)'}"
+        )
+        return _direct_or_saved_output("get-command-status", body)
+    if job.status == "cancelled":
+        return f"job {job.job_id}: cancelled after {_job_elapsed(job):.1f}s ({command})."
+    if job.status == "error":
+        return (
+            f"job {job.job_id}: error after {_job_elapsed(job):.1f}s ({command})\n"
+            f"{job.error or 'unknown error'}"
+        )
+    stdout_text = await asyncio.to_thread(_read_text_with_replace, job.stdout_path)
+    stderr_text = await asyncio.to_thread(_read_text_with_replace, job.stderr_path)
+    result = _format_command_result(
+        job.exit_code, stdout_text, stderr_text, job.timed_out, job.truncated, job.seconds
+    )
+    header = f"job {job.job_id}: {job.status} ({_job_elapsed(job):.1f}s)\n"
+    return _direct_or_saved_output("get-command-status", header + result)
+
+
+@tool(scope=SCOPE_COMMANDS_RUN)
+async def cancel_command(job_id: str) -> str:
+    """Kill a running background job's process tree and mark it cancelled."""
+    _prune_jobs()
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise ValueError(f"No background job {job_id!r}.")
+    if job.status != "running":
+        return f"job {job.job_id}: already {job.status}; nothing to cancel."
+    job.status = "cancelled"
+    if job.finished_at is None:
+        job.finished_at = _now()
+    if job.proc is not None:
+        with contextlib.suppress(Exception):
+            await _kill_tree(job.proc)
+    return f"job {job.job_id}: cancelled."
+
+
+@tool(scope=SCOPE_COMMANDS_RUN)
+async def list_commands() -> str:
+    """List tracked background command jobs (id, status, elapsed, command)."""
+    _prune_jobs()
+    if not _JOBS:
+        return "No background command jobs."
+    lines = [f"{'JOB_ID':<14} {'STATUS':<10} {'ELAPSED':>9}  COMMAND"]
+    for job in sorted(_JOBS.values(), key=lambda item: item.created_at):
+        command = f"{job.program} {' '.join(job.args)}".rstrip()
+        lines.append(
+            f"{job.job_id:<14} {job.status:<10} {_job_elapsed(job):>8.1f}s  {command}"
+        )
+    return _direct_or_saved_output("list-commands", "\n".join(lines))
+
+
+def _install_shutdown_hook(app) -> None:
+    """Cancel background jobs on graceful shutdown by composing our cleanup
+    around the app's existing lifespan. Starlette 1.x removed add_event_handler
+    and on_event, and FastMCP's streamable_http_app already installs its own
+    lifespan, so we wrap that instead of replacing it."""
+    base_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(scope_app):
+        async with base_lifespan(scope_app) as maybe_state:
+            try:
+                yield maybe_state
+            finally:
+                await _shutdown_running_jobs()
+
+    app.router.lifespan_context = _lifespan
+
+
+async def _shutdown_running_jobs() -> None:
+    """On graceful shutdown, kill any still-running background jobs so their child
+    process trees do not outlive the server. On Windows a child process is not
+    terminated automatically when its parent exits, so without this a long job
+    could be orphaned when the server is stopped."""
+    for job in list(_JOBS.values()):
+        if job.status == "running":
+            job.status = "cancelled"
+            if job.finished_at is None:
+                job.finished_at = _now()
+            if job.proc is not None:
+                with contextlib.suppress(Exception):
+                    await _kill_tree(job.proc)
 
 
 def _extract_token(request) -> str:
@@ -2569,6 +2872,7 @@ if __name__ == "__main__":
 
     _cleanup_temp_files()
     app = mcp.streamable_http_app()
+    _install_shutdown_hook(app)
     if AUTH_MODE == AUTH_MODE_LEGACY:
         app.add_middleware(SecurityMiddleware)
     else:
