@@ -267,9 +267,9 @@ Local MCP Easy вырос из проекта `notion-local-mcp-easy`.
 
 Universal-версия включает работу из трёх источников:
 
-- оригинальный проект `notion-local-mcp-easy` Олега Алёшина (GitHub: oleg494);
+- оригинальный проект `notion-local-mcp-easy` (GitHub: oleg494);
 - форк LEADBERG и его стабилизационные доработки;
-- OAuth- и совместимостный слой, разработанный вместе с командой Hyperagent/Fable.
+- OAuth- и совместимостный слой, разработанный вместе с командой Opus/Fable.
 
 Старая Notion-линия 1.x сохранена в ветке `legacy`.
 
