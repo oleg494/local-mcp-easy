@@ -20,7 +20,7 @@ Three `tunnel_backend` values exist; this document is about the middle one:
 ## What this is, and why
 
 sish speaks the exact same protocol Serveo does: the launcher opens
-`ssh -R <subdomain>:80:localhost:<port> <your-sish-host>`, and your sish
+`ssh -R <subdomain>:80:127.0.0.1:<port> <your-sish-host>`, and your sish
 server publishes `https://<subdomain>.<your-domain>` and forwards traffic
 back down the SSH connection to the local server on `127.0.0.1:8765`.
 Nothing about the client-side flow changes — same reserved-hostname model,

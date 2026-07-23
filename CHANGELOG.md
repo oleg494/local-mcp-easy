@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.3.1 — 2026-07-23 (Security patch)
+
+### Security
+
+- **Bump `mcp` to 1.28.1 and `starlette` to 1.3.1** to clear known CVEs
+  (CVE-2026-59950 in mcp; PYSEC-2026-248/249/2280/2281 in starlette) that
+  `pip-audit --strict` flags in the 2.3.0 pins — CI is green again.
+- **`connection.txt` is now created owner-only (`0600`) on POSIX.**
+  `publish_connection()` secured the config dir (`0700`) but never chmod'd the
+  file itself, so the Bearer token could be world-readable on shared POSIX
+  hosts.
+
+### Fixed
+
+- `build_release.py` excludes `.remember/` so stray local files never enter the
+  release archive.
+- Docs: `SISH_SETUP.md` ssh-forward example uses `127.0.0.1`; `SECURITY.md`
+  documents the sish threat model; `README.en.md` refreshed (sish/POSIX
+  wrappers, correct test count).
+
 ## 2.3.0 — 2026-07-23 (Cross-platform, supply-chain, self-hosted tunnels)
 
 ### Added

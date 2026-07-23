@@ -14,8 +14,11 @@ Streamable HTTP and OAuth 2.1.
 One-click local MCP server for Windows: your AI agent gets safe, bounded
 tools to read, search and edit files in a workspace folder you choose — with
 an optional trusted developer mode (Python, Git, Node) and a guarded Git
-setup-flow. A stable public URL is provided by a reserved Serveo tunnel or
-your own reverse proxy.
+setup-flow. A stable public URL is provided by a reserved Serveo tunnel,
+your own reverse proxy, or a self-hosted sish tunnel (see
+[SISH_SETUP.md](SISH_SETUP.md) and [REVERSE_PROXY.md](REVERSE_PROXY.md)).
+Linux/macOS users run the `.sh` wrappers (`./setup.sh`, `./start.sh`, ...)
+instead of the `.bat` files.
 
 Compatible with Hyperagent, Notion and other MCP clients.
 
@@ -133,7 +136,7 @@ pre-2.0 `NotionMcpEasy` directory are migrated automatically on first run).
 .venv\Scripts\ruff check .
 ```
 
-The suite (147 tests) covers path traversal, token auth, the full OAuth flow
+The suite (261 tests) covers path traversal, token auth, the full OAuth flow
 (DCR, PKCE, consent, rotation, replay revocation, revocation, restart
 survival), per-tool scope enforcement, dual mode, the git guard-layer and the
 launcher.

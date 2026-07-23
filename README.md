@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
-![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)
 
 Локальные файловые инструменты, команды и Git через MCP — по Streamable HTTP с OAuth 2.1.
 
