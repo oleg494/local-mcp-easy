@@ -1,5 +1,70 @@
 # Changelog
 
+## 2.2.1 — 2026-07-23 (Security & stability hardening)
+
+### Security — may require client changes
+
+- **Confidential OAuth clients must now authenticate.** A new
+  `ClientSecretAuthMiddleware` enforces `client_secret_basic` /
+  `client_secret_post` for every confidential client whenever OAuth is
+  enabled (all modes except `legacy`). Clients that previously connected
+  without presenting their registered `client_secret` will now be rejected;
+  re-supply the secret or re-register as a public PKCE client. Client
+  secrets are stored only as SHA-256 hashes at rest (`oauth_state.json`
+  never holds the plaintext); the raw secret is still returned once at
+  registration time per RFC 7591.
+- **Refresh-token reuse now revokes the whole token family** (RFC 9700
+  §4.14.2). Replaying an already-rotated refresh token revokes the entire
+  family, including the currently-valid latest token — not just the
+  replayed one. A client that accidentally reuses an old refresh token must
+  restart the authorization flow.
+
+### Fixed (security)
+
+- Sanitized the environment passed to child processes so secrets no longer
+  leak into `run_command` / background jobs.
+- Closed a `git -c` / global-option argument-injection (RCE gadget) path,
+  and hardened git handling: refspec branch-delete guard, force-push block,
+  fetch/pull refspec validation, and a `.git` / repo-context write guard.
+- Constant-time comparison (`_consteq`) for all token/secret checks
+  (5 call sites).
+- Guarded `urlsplit` port parsing against `ValueError`.
+- OAuth consent now requires an explicit `action == "approve"`.
+
+### Changed (launcher hardening)
+
+- Config directory created `0700` and `connection.txt` `0600`; the Bearer
+  token is masked in console output, so it is no longer group/world-readable
+  on shared POSIX hosts.
+- Process identity works off-Linux: `process_command_line()` falls back to
+  `ps` when `/proc` is absent (macOS/BSD), so start/stop detection works.
+- `stop_pid()` escalates SIGTERM → wait → SIGKILL and returns real process
+  liveness instead of an unconditional success.
+- Tunnel reconnect uses exponential backoff (3s, 6s, 12s … capped at 5 min)
+  instead of a tight retry loop.
+
+### Changed (logging)
+
+- The launcher is now the single owner of `server.log`: it spawns the
+  server with piped output and writes through a `RotatingFileHandler`
+  (append + size-based rotation, bounded at `(backups+1) × maxBytes`)
+  instead of truncating the log on every launch. This fixes a Windows
+  `PermissionError` on rotation caused by two writers holding the file.
+- `mcp.server.streamable_http` is quieted to `WARNING` to cut transport
+  noise, while `uvicorn.access` stays at `INFO` so tunnel/transport drops
+  remain visible.
+
+### Internal / tests
+
+- Async file tools run via `asyncio.to_thread` so slow disk I/O no longer
+  blocks the event loop.
+- New test suites: `test_env_sanitization`, `test_git_hardening`,
+  `test_file_trust_anchor`, `test_async_fs_tools`, `test_logging_hygiene`,
+  plus `test_oauth_store` / `test_oauth_flow` additions for refresh-token
+  family revocation and confidential-client secret enforcement.
+- Fixed a spurious local failure by using the bare allow-listed `python`
+  interpreter in the env-sanitization spawn test.
+
 ## 2.2.0 — 2026-07-22 (Background command jobs)
 
 ### Added
