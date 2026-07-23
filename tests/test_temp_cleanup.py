@@ -28,11 +28,11 @@ class OrphanMcpTmpCleanupTests(unittest.TestCase):
         self._orig_base_dir = server.BASE_DIR
         server.BASE_DIR = self._tmp_base
         # Force the monotonic throttle to consider a sweep overdue.
-        server._last_orphan_sweep = 0.0
+        server._last_orphan_sweep = float("-inf")
 
     def tearDown(self):
         server.BASE_DIR = self._orig_base_dir
-        server._last_orphan_sweep = 0.0
+        server._last_orphan_sweep = float("-inf")
         import shutil
 
         shutil.rmtree(self._tmp_base, ignore_errors=True)

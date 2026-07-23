@@ -290,8 +290,9 @@ def _cleanup_temp_files() -> None:
 
 
 # Monotonic-clock timestamp (seconds) of the last orphan .mcp-tmp sweep.
-# Initialized to 0.0 so the first call always performs a sweep.
-_last_orphan_sweep: float = 0.0
+# Initialized to -inf so the first call always sweeps, even on a freshly booted
+# host where time.monotonic() is still below ORPHAN_SWEEP_MIN_INTERVAL_SECONDS.
+_last_orphan_sweep: float = float("-inf")
 
 
 def _cleanup_orphan_mcp_tmp() -> None:
