@@ -133,6 +133,66 @@ What each piece is doing, mapped to the requirements:
 443/tcp in this example) and nothing else related to sish. Leave your
 normal admin SSH (22/tcp) locked down the way you already lock it down.
 
+**4. On-demand certificates are the most fragile part of this setup — know this going in.**
+
+`--https-ondemand-certificate` relies on `certmagic` (the ACME library sish
+embeds) successfully completing a *live* ACME registration and per-subdomain
+issuance every time a new subdomain is first requested over HTTPS. Two real
+failure modes to know about, from sish's own issue tracker:
+
+- **A stale or manually-copied ACME account/certificate cache will not "just
+  work."** An ACME account is tied to a real registration on Let's Encrypt's
+  servers (an account key + registration URI); files copied in from a
+  different install, archive, or backup almost never match byte-for-byte
+  what a live registration produced. When certmagic's on-disk state is
+  inconsistent, it doesn't fail fast — it can back off silently for **hours
+  at a time** (observed: 6h between retries, up to 720h/30 days total)
+  before trying again ([sish#155](https://github.com/antoniomika/sish/issues/155)).
+  This looks exactly like "nothing is happening," because nothing *is*
+  happening until the backoff window passes.
+- **On-demand issuance behind SNI-multiplexed port 443** (e.g. this guide's
+  nginx `ssl_preread` setup) **is a known sharp edge.** sish itself shipped a
+  bug where ACME challenge requests got misrouted to the tunnel client
+  instead of being intercepted by the certificate issuer
+  ([sish#243](https://github.com/antoniomika/sish/pull/243), fixed 2022).
+  Recent sish versions include the fix, but it's evidence this exact
+  combination — SNI proxy in front, on-demand TLS behind — is inherently
+  more moving parts than a plain deployment.
+
+**If a subdomain keeps serving the base domain's certificate instead of
+getting its own:**
+
+1. Stop sish, then locate certmagic's storage — check inside your
+   `--https-certificate-directory` first (its account/cert cache often
+   lands there alongside static certs); otherwise check the default
+   `~/.local/share/certmagic` under whichever `$HOME` your sish service's
+   user resolves to.
+2. Back up that directory, then **wipe it clean** rather than trying to
+   reconcile a copied-in account. Let certmagic register a brand new
+   account from scratch.
+3. Restart sish with `journalctl -u sish -f` open, and in a second terminal
+   request a **subdomain you have never tried before** (a previously-failed
+   one may already sit in a cached backoff):
+   `curl -vk https://<never-used-name>.<tunnel_domain>`. Watch the ACME
+   attempt happen live instead of inferring from a served certificate.
+4. If there's still zero ACME log activity on that fresh request, confirm
+   `--https-ondemand-certificate-accept-terms=true` and
+   `--https-ondemand-certificate-email=...` are actually present in the
+   *running* command (`systemctl cat sish` or `ps aux | grep sish`) —
+   certmagic will not attempt auto-registration without both.
+
+**If on-demand TLS keeps fighting you, sidestep it.** sish's own docs
+recommend this for exactly this scenario: issue **one wildcard certificate
+via DNS-01** (certbot or another ACME client, using your DNS provider's API
+— or a manual challenge if it doesn't have one) and drop it into
+`--https-certificate-directory` as a static `<domain>.crt`/`<domain>.key`
+pair. This is not a workaround; it's how sish's own maintainers run their
+own public instance, and it sidesteps on-demand TLS entirely — no
+per-subdomain live issuance, no dependency on ACME validation traffic
+correctly threading through your SNI-multiplexing layer. Trade-off: you
+handle wildcard renewal yourself (a cron'd `certbot renew` covers this in
+practice).
+
 ## Client setup (Local MCP Easy side)
 
 On the Windows machine, either run the wizard:

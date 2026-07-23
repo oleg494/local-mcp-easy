@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.3.2 — 2026-07-23 (CI/test fixes, sish docs)
+
+### Fixed
+
+- The orphan `.mcp-tmp` sweep now runs on its very first call (server startup)
+  even on a freshly booted host: the monotonic throttle stamp is initialized to
+  `-inf` instead of `0.0`, so `time.monotonic()` being below the throttle
+  interval no longer skips the first sweep.
+
+### Tests
+
+- Path assertions resolve their temp base so they pass on macOS, where the temp
+  dir under `/var` is a symlink to `/private/var` (the code canonicalizes paths
+  with `.resolve()` as a symlink-escape defence). Fixes the macOS CI cells; the
+  full 12-cell matrix (Ubuntu/macOS/Windows × Python 3.10–3.13) is green.
+
+### Docs
+
+- `SISH_SETUP.md`: add an on-demand-certificate (certmagic/ACME) troubleshooting
+  section — stale account caches, SNI-multiplexed on-demand issuance sharp
+  edges, and the DNS-01 wildcard fallback.
+
 ## 2.3.1 — 2026-07-23 (Security patch)
 
 ### Security
