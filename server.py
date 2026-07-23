@@ -8,6 +8,7 @@ import datetime as dt
 import fnmatch
 import functools
 import json
+import logging
 import os
 import re
 import secrets
@@ -3118,6 +3119,16 @@ if OAUTH_ENABLED:
         return JSONResponse(protected_resource_document(PUBLIC_URL), headers=headers)
 
 
+def _configure_logging() -> None:
+    """Quiet per-request streamable-HTTP session chatter.
+
+    Each MCP call logs an INFO line from this logger; at steady state it floods
+    server.log with no diagnostic value. uvicorn.access is deliberately left
+    alone -- its GET /mcp 200 OK lines are how we spot transport drops.
+    """
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -3149,4 +3160,5 @@ if __name__ == "__main__":
             f"{PUBLIC_URL}/.well-known/oauth-authorization-server | "
             f"{PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"
         )
+    _configure_logging()
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
