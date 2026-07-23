@@ -58,24 +58,69 @@ def config_auth_mode(config: dict) -> str:
     return mode if mode in AUTH_MODES else "legacy"
 
 
+TUNNEL_BACKENDS = ("serveo", "sish", "custom-ssh")
+
+
+def config_tunnel_backend(config: dict) -> str:
+    """Which tunnel backend the launcher manages.
+
+    - ``"serveo"``     -- the public Serveo relay (default; unchanged 2.2.x UX).
+    - ``"sish"``       -- a self-hosted sish server on the operator's own VPS,
+      reached over the *same* ``ssh -R`` remote-forward semantics as Serveo. It
+      needs ``tunnel_host`` (the sish SSH endpoint), ``tunnel_domain`` (the
+      public wildcard base domain), a reserved subdomain in ``serveo_hostname``
+      and an ``ssh_key``. The operator owns the node, so POST/streaming
+      timeouts are theirs to set.
+    - ``"custom-ssh"`` -- the operator runs their own tunnel/reverse proxy and
+      sets ``public_url`` explicitly; the launcher starts no tunnel.
+    """
+    backend = str(config.get("tunnel_backend", "serveo")).strip().lower()
+    return backend if backend in TUNNEL_BACKENDS else "serveo"
+
+
 def config_public_url(config: dict) -> str:
     """Effective public base URL for OAuth.
 
     A custom stable domain (own reverse proxy / tunnel) set via ``public_url``
-    takes precedence; otherwise the reserved Serveo hostname is used. Empty
-    string means "no stable URL configured"."""
+    takes precedence. Otherwise the URL is derived from the active tunnel
+    backend: Serveo (`<sub>.serveousercontent.com`) or a self-hosted sish
+    server (`<sub>.<tunnel_domain>`). Empty string means "no stable URL"."""
     custom = str(config.get("public_url", "")).strip().rstrip("/")
     if custom:
         return custom
     hostname = str(config.get("serveo_hostname", "")).strip().lower()
+    backend = config_tunnel_backend(config)
+    if backend == "sish":
+        domain = str(config.get("tunnel_domain", "")).strip().lower().strip(".")
+        if hostname and domain:
+            return f"https://{hostname}.{domain}"
+        return ""
+    if backend == "custom-ssh":
+        return ""
     if hostname:
         return f"https://{hostname}.serveousercontent.com"
     return ""
 
 
+def tunnel_process_match(config: dict) -> str:
+    """Substring that identifies the ssh tunnel process for a safe stop.
+
+    ``stop_pid`` refuses to kill a PID whose command line does not contain this
+    marker. For Serveo it is the well-known relay host; for a self-hosted sish
+    backend it is the operator's configured tunnel host (the final argument of
+    the ``ssh -R`` command line).
+    """
+    if config_tunnel_backend(config) == "sish":
+        return str(config.get("tunnel_host", "")).strip() or "ssh"
+    return "serveo.net"
+
+
 def config_uses_serveo(config: dict) -> bool:
-    """Whether the launcher should manage a Serveo tunnel. A custom public_url
-    means the operator runs their own tunnel/proxy, so Serveo is skipped."""
+    """Whether the launcher manages the tunnel itself (Serveo or self-hosted
+    sish). A custom ``public_url`` -- or the ``custom-ssh`` backend -- means the
+    operator runs their own tunnel/proxy, so the launcher starts nothing."""
+    if config_tunnel_backend(config) == "custom-ssh":
+        return False
     return not str(config.get("public_url", "")).strip()
 
 
@@ -843,6 +888,27 @@ def build_tunnel_command(config: dict) -> list[str]:
         "-o",
         "ExitOnForwardFailure=yes",
     ]
+    if config_tunnel_backend(config) == "sish":
+        tunnel_host = str(config.get("tunnel_host", "")).strip()
+        if not tunnel_host:
+            raise RuntimeError(
+                "sish tunnel backend requires 'tunnel_host' (the sish SSH "
+                "endpoint) in the config."
+            )
+        key_path = Path(str(config.get("ssh_key", ""))).expanduser().resolve()
+        if not key_path.is_file():
+            raise RuntimeError(f"sish private SSH key not found: {key_path}")
+        command.extend(["-i", str(key_path), "-o", "IdentitiesOnly=yes"])
+        ssh_port = str(config.get("tunnel_ssh_port", "")).strip()
+        if ssh_port:
+            command.extend(["-p", ssh_port])
+        # sish speaks the same ssh -R remote-forward as Serveo; the reserved
+        # subdomain (serveo_hostname) is bound on sish's HTTP listener (:80).
+        remote = (
+            f"{hostname}:80:127.0.0.1:{port}" if hostname else f"80:127.0.0.1:{port}"
+        )
+        command.extend(["-R", remote, tunnel_host])
+        return command
     if hostname:
         key_path = Path(str(config.get("ssh_key", ""))).expanduser().resolve()
         if not key_path.is_file():
@@ -902,6 +968,22 @@ def wait_for_url(
     raise tunnel_error("Tunnel URL was not received")
 
 
+def _await_tunnel_startup(process, startup_grace: float) -> None:
+    """Give a reserved-subdomain tunnel a moment to fail fast.
+
+    Serveo and sish both know the URL ahead of time (no announcement to wait
+    for), so we only watch for an immediate exit (bad key, refused forward)
+    before reporting success.
+    """
+    deadline = time.time() + max(0.0, startup_grace)
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise tunnel_error(f"SSH tunnel exited with code {process.returncode}")
+        time.sleep(0.1)
+    if process.poll() is not None:
+        raise tunnel_error(f"SSH tunnel exited with code {process.returncode}")
+
+
 def resolve_tunnel_url(
     config: dict,
     process: subprocess.Popen,
@@ -915,17 +997,19 @@ def resolve_tunnel_url(
     so waiting for an announcement would cause a false timeout.
     """
     hostname = str(config.get("serveo_hostname", "")).strip().lower()
+    if config_tunnel_backend(config) == "sish":
+        url = config_public_url(config)
+        if not url:
+            raise tunnel_error(
+                "sish backend needs a stable public URL: set 'serveo_hostname' "
+                "(the reserved subdomain) and 'tunnel_domain'."
+            )
+        _await_tunnel_startup(process, startup_grace)
+        return url
     if not hostname:
         return wait_for_url(process, lines)
 
-    deadline = time.time() + max(0.0, startup_grace)
-    while time.time() < deadline:
-        if process.poll() is not None:
-            raise tunnel_error(f"SSH tunnel exited with code {process.returncode}")
-        time.sleep(0.1)
-
-    if process.poll() is not None:
-        raise tunnel_error(f"SSH tunnel exited with code {process.returncode}")
+    _await_tunnel_startup(process, startup_grace)
     return f"https://{hostname}.serveousercontent.com"
 
 
@@ -937,15 +1021,18 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
         "server_pid": server_pid,
         "server_match": "server.py",
         "tunnel_pid": tunnel_pid,
-        "tunnel_match": "serveo.net",
+        "tunnel_match": tunnel_process_match(config),
         "url": endpoint,
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
     save_json(RUNTIME_FILE, runtime)
     mode = "trusted developer" if config.get("allow_commands", False) else "file-only"
     hostname = str(config.get("serveo_hostname", "")).strip()
+    backend = config_tunnel_backend(config)
     if str(config.get("public_url", "")).strip():
         tunnel_mode = "custom stable URL (own proxy)"
+    elif backend == "sish":
+        tunnel_mode = f"sish self-hosted ({config_public_url(config)})"
     elif hostname:
         tunnel_mode = f"stable ({hostname})"
     else:
@@ -1095,7 +1182,7 @@ def run() -> int:
         return 1
     finally:
         if tunnel is not None and tunnel.poll() is None:
-            stop_pid(tunnel.pid, "serveo.net")
+            stop_pid(tunnel.pid, tunnel_process_match(config))
         if server is not None and server.poll() is None:
             stop_pid(server.pid, "server.py")
         RUNTIME_FILE.unlink(missing_ok=True)
@@ -1321,6 +1408,116 @@ def register_oauth_client() -> int:
     return 0
 
 
+def _prompt_value(label: str, current: str) -> str:
+    prompt = f"{label} [{current}]" if current else label
+    return input(f"{prompt}: ").strip() or current
+
+
+def tunnel_setup() -> int:
+    """Configure the tunnel backend: serveo (default), sish (self-hosted) or
+    custom-ssh (bring your own reverse proxy/tunnel)."""
+    config = load_json(CONFIG_FILE)
+    if not config:
+        print("Run SETUP.bat first: the base configuration does not exist yet.")
+        return 1
+    print("")
+    print(f"=== Local MCP Easy {VERSION}: tunnel backend ===")
+    print("")
+    current = config_tunnel_backend(config)
+    print(f"Current backend: {current}")
+    for index, name in enumerate(TUNNEL_BACKENDS, start=1):
+        print(f"  {index}. {name}")
+    choice = input(f"Select backend [{current}]: ").strip()
+    backend = current
+    if choice:
+        if not choice.isdigit() or not 1 <= int(choice) <= len(TUNNEL_BACKENDS):
+            print("Invalid selection; nothing changed.")
+            return 1
+        backend = TUNNEL_BACKENDS[int(choice) - 1]
+    config["tunnel_backend"] = backend
+
+    if backend == "sish":
+        tunnel_host = _prompt_value(
+            "sish SSH endpoint host (e.g. tunnel.example.com)",
+            str(config.get("tunnel_host", "")).strip(),
+        )
+        if not tunnel_host:
+            print("A tunnel_host is required for sish; nothing changed.")
+            return 1
+        config["tunnel_host"] = tunnel_host
+        ssh_port = _prompt_value(
+            "sish SSH port (blank = 22)",
+            str(config.get("tunnel_ssh_port", "")).strip(),
+        )
+        if ssh_port and not ssh_port.isdigit():
+            print("SSH port must be numeric; nothing changed.")
+            return 1
+        if ssh_port:
+            config["tunnel_ssh_port"] = ssh_port
+        else:
+            config.pop("tunnel_ssh_port", None)
+        domain = _prompt_value(
+            "Public wildcard base domain (e.g. tunnel.example.com)",
+            str(config.get("tunnel_domain", "")).strip().lower(),
+        ).lower().strip(".")
+        if not domain:
+            print("A tunnel_domain is required for sish; nothing changed.")
+            return 1
+        config["tunnel_domain"] = domain
+        subdomain = _prompt_value(
+            "Reserved subdomain label",
+            str(config.get("serveo_hostname", "")).strip().lower(),
+        ).lower().removesuffix("." + domain)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", subdomain):
+            print("Subdomain must be 3-63 lowercase letters, digits or hyphens; nothing changed.")
+            return 1
+        config["serveo_hostname"] = subdomain
+        default_key = (
+            Path(str(config.get("ssh_key", ""))).expanduser().resolve()
+            if str(config.get("ssh_key", "")).strip()
+            else (Path.home() / ".ssh" / "sish_local_mcp").resolve()
+        )
+        while True:
+            raw_key = input(f"Private SSH key [{default_key}]: ").strip().strip('\"')
+            key_path = normalize_workspace_path(raw_key) if raw_key else default_key
+            if key_path.is_file():
+                break
+            print(f"Private key not found: {key_path}")
+        config["ssh_key"] = str(key_path)
+        config.pop("public_url", None)
+        print("")
+        print(f"sish backend saved. Public URL: {config_public_url(config)}")
+        print("SECURITY: this publishes an entry point to a command-executing")
+        print("server. Keep OAuth on, run sish pubkey-only on a non-standard")
+        print("port, disable random tunnels, and confirm long streaming requests")
+        print("survive before relying on it (see SISH_SETUP.md).")
+    elif backend == "custom-ssh":
+        custom_url = _prompt_value(
+            "Public URL your own proxy/tunnel serves (https://...)",
+            str(config.get("public_url", "")).strip().rstrip("/"),
+        ).rstrip("/")
+        if not (
+            custom_url.startswith("https://")
+            or custom_url.startswith("http://127.0.0.1")
+            or custom_url.startswith("http://localhost")
+        ):
+            print("Public URL must be https:// (or http://127.0.0.1 for local testing); nothing changed.")
+            return 1
+        config["public_url"] = custom_url
+        port = config.get("port", 8765)
+        print(f"custom-ssh backend saved. Route {custom_url} -> http://127.0.0.1:{port}")
+        print("The launcher will not start a tunnel in this mode.")
+    else:
+        config.pop("public_url", None)
+        print("Serveo backend selected. Use SETUP.bat to reserve a hostname for")
+        print("a stable URL, or leave it blank for a temporary tunnel.")
+
+    save_json(CONFIG_FILE, config)
+    print("")
+    print(f"Tunnel backend saved: {backend} ({CONFIG_FILE})")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=f"One-click launcher for Local MCP Easy {VERSION}"
@@ -1338,6 +1535,11 @@ def main() -> int:
         "--register-oauth-client",
         action="store_true",
         help="pre-register an OAuth client (Bring my own OAuth app)",
+    )
+    parser.add_argument(
+        "--tunnel-setup",
+        action="store_true",
+        help="configure the tunnel backend (serveo/sish/custom-ssh)",
     )
     parser.add_argument(
         "--add-command",
@@ -1370,6 +1572,9 @@ def main() -> int:
         return oauth_setup()
     if args.register_oauth_client:
         return register_oauth_client()
+    if args.tunnel_setup:
+        stop_all()
+        return tunnel_setup()
     if args.show:
         return show_connection(args.full)
     return run()

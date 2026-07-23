@@ -2893,7 +2893,10 @@ def _host_allowed(host_header: str) -> bool:
     host = host_header.split(":", 1)[0].strip().lower()
     if host in {"127.0.0.1", "localhost"}:
         return True
-    if OAUTH_ENABLED and PUBLIC_HOST and host == PUBLIC_HOST:
+    # A configured public host (Serveo reserved, a custom reverse proxy, or a
+    # self-hosted sish domain) is always allowed so Bearer/legacy clients work
+    # behind it too, not only OAuth clients.
+    if PUBLIC_HOST and host == PUBLIC_HOST:
         return True
     if STABLE_HOSTNAME:
         return host == f"{STABLE_HOSTNAME}{SERVEO_SUFFIX}"
