@@ -5,8 +5,8 @@
 [![CI](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml/badge.svg)](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.12-blue.svg)
-![Tests](https://img.shields.io/badge/tests-231%20passing-brightgreen.svg)
+![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
+![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
 
 Run local filesystem, command and Git tools through MCP using
 Streamable HTTP and OAuth 2.1.

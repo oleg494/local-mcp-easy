@@ -1,5 +1,48 @@
 # Changelog
 
+## 2.3.0 — 2026-07-23 (Cross-platform, supply-chain, self-hosted tunnels)
+
+### Added
+
+- **Self-hosted `sish` tunnel backend.** A new `tunnel_backend` setting
+  (`serveo` | `sish` | `custom-ssh`) lets you front the server with your own
+  sish server over the same `ssh -R` remote-forward as Serveo, so you own the
+  POST/streaming timeouts (the real fix for edge churn, not a symptom patch).
+  Configure it with `TUNNEL_SETUP.bat` / `./tunnel_setup.sh`
+  (`launcher.py --tunnel-setup`); see `SISH_SETUP.md`. OAuth stays mandatory on
+  a public entry point. Serveo remains the default and existing configs are
+  unchanged.
+- **POSIX wrappers** mirroring the `.bat` scripts for Linux/macOS: `setup.sh`,
+  `start.sh`, `stop.sh`, `oauth_setup.sh`, `register_oauth_client.sh`,
+  `show_connection.sh`, `build_release.sh`, `tunnel_setup.sh`.
+- **Reverse-proxy guide** (`REVERSE_PROXY.md`) for nginx / caddy / traefik.
+- `MCP_TEMP_FILE_TTL` and `MCP_MAX_COPY_MOVE_BYTES` environment overrides.
+- `.gitattributes` pins `VERSION` (CRLF) and shell/batch line endings.
+
+### Changed
+
+- **Dependencies:** `mcp` pinned to `1.27.2` and the unused `[cli]` extra
+  dropped. Operators who relied on the `mcp` CLI being installed by this
+  package must `pip install "mcp[cli]"` separately; the server never used it.
+- **CI:** matrix over Ubuntu / macOS / Windows × Python 3.10–3.13 (3.13 is
+  allowed-failure for now), `pip-audit --strict`, Dependabot, and a pinned ruff.
+- `copy_file` / `move_file` now reject sources larger than ~100 MB
+  (override with `MCP_MAX_COPY_MOVE_BYTES`), enforced after the existing
+  trust-anchor guard, to stop a `mcp:files:write` holder from exhausting disk.
+
+### Fixed
+
+- Orphaned `.mcp-tmp` files left by a crash between write and atomic rename are
+  now swept from the workspace (rate-limited), not only `temp/*.txt`.
+- A configured public host (Serveo, a custom proxy, or a self-hosted sish
+  domain) is accepted by the host allowlist in legacy/Bearer mode too, not only
+  under OAuth.
+
+### Internal
+
+- Removed the dead `_capture_process` helper; `allowed_commands` now has a
+  single source of truth in `core.py`.
+
 ## 2.2.1 — 2026-07-23 (Security & stability hardening)
 
 ### Security — may require client changes

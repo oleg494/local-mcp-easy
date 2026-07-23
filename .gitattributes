@@ -1,0 +1,8 @@
+# Keep the release VERSION byte-exact (CRLF) across platforms.
+VERSION -text
+
+# POSIX shell wrappers must stay LF so the shebang works on Linux/macOS.
+*.sh text eol=lf
+
+# Windows batch files stay CRLF.
+*.bat text eol=crlf

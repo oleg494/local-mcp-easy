@@ -3,12 +3,12 @@
 [![CI](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml/badge.svg)](https://github.com/oleg494/local-mcp-easy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.12-blue.svg)
-![Tests](https://img.shields.io/badge/tests-231%20passing-brightgreen.svg)
+![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
+![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
 
 Локальные файловые инструменты, команды и Git через MCP — по Streamable HTTP с OAuth 2.1.
 
-One-click MCP-сервер для Windows: агент получает безопасные инструменты для чтения, поиска и изменения файлов в выбранной рабочей папке. Отдельно включается доверенный developer-режим (Python, Git, Node) с защитным git setup-flow. Стабильный публичный адрес — через зарезервированный Serveo hostname или собственный домен.
+One-click MCP-сервер для Windows: агент получает безопасные инструменты для чтения, поиска и изменения файлов в выбранной рабочей папке. Отдельно включается доверенный developer-режим (Python, Git, Node) с защитным git setup-flow. Стабильный публичный адрес — через зарезервированный Serveo hostname, собственный домен за обратным прокси или self-hosted sish-туннель (см. `SISH_SETUP.md` и `REVERSE_PROXY.md`). На Linux/macOS вместо `.bat` используйте `.sh`-обёртки (`./setup.sh`, `./start.sh`, …).
 
 Совместим с Hyperagent, Notion и другими MCP-клиентами.
 
