@@ -67,7 +67,15 @@ def normalize_resource(url: str) -> str:
     parts = urlsplit((url or "").strip())
     scheme = parts.scheme.lower()
     host = (parts.hostname or "").lower()
-    port = parts.port
+    try:
+        port = parts.port
+    except ValueError:
+        # A malformed port (out of range / non-numeric) must not raise here:
+        # on /authorize that would surface as an unauthenticated 500 instead
+        # of the standard invalid_request error. Keep the raw netloc as the
+        # host so the value can never normalize to a valid resource and
+        # accidentally match; the caller then falls through to invalid_request.
+        return f"{scheme}://{(parts.netloc or '').lower()}{parts.path.rstrip('/')}"
     if port is not None and not (
         (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
     ):

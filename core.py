@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 from pathlib import Path
+
+
+def _consteq(a: str, b: str) -> bool:
+    """Constant-time string comparison that never raises on hostile input.
+
+    hmac.compare_digest raises TypeError when handed a non-ASCII str (or a
+    str/bytes mix), which would surface as an unhandled 500 instead of a clean
+    401/403. Encoding both sides to bytes first keeps the comparison
+    timing-safe while making an attacker-controlled token fail closed.
+    """
+    return hmac.compare_digest(a.encode("utf-8", "ignore"), b.encode("utf-8", "ignore"))
 
 DEFAULT_EXCLUDES = {
     ".git",

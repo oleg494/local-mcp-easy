@@ -6,9 +6,9 @@ lookup, so static-token clients such as Notion keep connecting exactly as before
 """
 from __future__ import annotations
 
-import hmac
-
 from mcp.server.auth.provider import AccessToken
+
+from core import _consteq
 
 from .base import ALL_SCOPES, LEGACY_CLIENT_ID
 
@@ -24,7 +24,7 @@ class LegacyTokenVerifier:
     def matches(self, candidate: str) -> bool:
         if not candidate:
             return False
-        return hmac.compare_digest(candidate, self._token)
+        return _consteq(candidate, self._token)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         if not self.matches(token):

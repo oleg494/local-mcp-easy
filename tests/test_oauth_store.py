@@ -8,8 +8,10 @@ from urllib.parse import parse_qs, urlsplit
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
+from core import _consteq  # noqa: E402
 from mcp.server.auth.provider import (  # noqa: E402
     AuthorizationParams,
+    AuthorizeError,
     RegistrationError,
     TokenError,
 )
@@ -31,6 +33,7 @@ from auth import (  # noqa: E402
     SCOPE_GIT,
     build_auth_settings,
     normalize_resource,
+    resources_match,
 )
 from auth.oauth import PendingAuthorization  # noqa: E402
 
@@ -480,6 +483,94 @@ class ConsentHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertIn("error=access_denied", response.headers["location"])
+
+    async def test_D_non_ascii_owner_code_is_clean_403_not_500(self):
+        # A non-ASCII owner code must fail the constant-time comparison with a
+        # clean 403 rather than surfacing hmac.compare_digest's TypeError as 500.
+        txn = await self._make_txn()
+        response = self.http.post(
+            "/consent",
+            data={
+                "txn": txn.txn_id,
+                "csrf": txn.csrf,
+                "owner_code": "wröng-cödé",
+                "action": "approve",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+
+    async def test_D_non_ascii_csrf_is_clean_400_not_500(self):
+        txn = await self._make_txn()
+        response = self.http.post(
+            "/consent",
+            data={
+                "txn": txn.txn_id,
+                "csrf": "förged-tökén",
+                "owner_code": "owner-code-1",
+                "action": "approve",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+
+    async def test_F_bogus_action_is_rejected_and_records_no_grant(self):
+        # Anything other than an explicit "approve" (even with a valid owner
+        # code and CSRF) must be refused without minting an authorization code.
+        txn = await self._make_txn()
+        response = self.http.post(
+            "/consent",
+            data={
+                "txn": txn.txn_id,
+                "csrf": txn.csrf,
+                "owner_code": "owner-code-1",
+                "action": "bogus",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 400)
+        # No grant recorded: the transaction is still pending and no code exists.
+        self.assertIsNotNone(self.provider.get_txn(txn.txn_id))
+        self.assertEqual(len(self.provider._codes), 0)
+
+
+class TokenCompareHardeningTests(unittest.TestCase):
+    """Fix D: constant-time comparison must never raise on hostile input."""
+
+    def test_D_consteq_matches_and_rejects_ascii(self):
+        self.assertTrue(_consteq("secret-token", "secret-token"))
+        self.assertFalse(_consteq("secret-token", "other-token"))
+
+    def test_D_consteq_non_ascii_returns_false_without_raising(self):
+        # hmac.compare_digest raises TypeError on non-ASCII str; _consteq must
+        # return False instead so a hostile bearer token yields 401, not 500.
+        self.assertFalse(_consteq("tökén", "token"))
+        self.assertFalse(_consteq("token", "tökén"))
+
+    def test_D_legacy_verifier_non_ascii_token_returns_false(self):
+        verifier = LegacyTokenVerifier("master-token")
+        self.assertFalse(verifier.matches("nön-ascii-tökén"))
+        self.assertTrue(verifier.matches("master-token"))
+
+
+class ResourceValidationHardeningTests(unittest.IsolatedAsyncioTestCase):
+    """Fix E: a malformed resource must yield invalid_request, not a 500."""
+
+    def test_E_malformed_resource_does_not_raise_in_match(self):
+        # urlsplit(...).port raises ValueError on an out-of-range port; the
+        # audience check must swallow that and simply report a non-match.
+        self.assertFalse(resources_match("http://x:99999999", RESOURCE))
+
+    async def test_E_authorize_maps_malformed_resource_to_invalid_request(self):
+        store = OAuthStore(Path(tempfile.mktemp()))
+        provider = LocalOAuthProvider(
+            store=store, issuer_url=ISSUER, canonical_resource=RESOURCE
+        )
+        client = make_client()
+        await provider.register_client(client)
+        with self.assertRaises(AuthorizeError) as caught:
+            await provider.authorize(
+                client, make_params(resource="http://x:99999999")
+            )
+        self.assertEqual(caught.exception.error, "invalid_request")
 
 
 class RedirectValidationTests(unittest.TestCase):

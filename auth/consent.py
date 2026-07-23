@@ -17,13 +17,14 @@ with a short self-healing rolling window.
 """
 from __future__ import annotations
 
-import hmac
 import html
 import time
 from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+from core import _consteq
 
 from .base import SCOPE_DESCRIPTIONS
 from .oauth import LocalOAuthProvider, PendingAuthorization
@@ -110,7 +111,7 @@ class ConsentHandler:
     def _check_owner_code(self, candidate: str) -> bool:
         if not candidate:
             return False
-        return hmac.compare_digest(candidate, self.owner_code)
+        return _consteq(candidate, self.owner_code)
 
     def _throttled(self) -> bool:
         """True when too many WRONG attempts happened in the rolling window.
@@ -138,7 +139,7 @@ class ConsentHandler:
         if txn is None:
             return self._expired_page()
         csrf = str(form.get("csrf", ""))
-        if not hmac.compare_digest(csrf, txn.csrf):
+        if not _consteq(csrf, txn.csrf):
             return self._expired_page()
 
         action = str(form.get("action", ""))
@@ -148,6 +149,13 @@ class ConsentHandler:
             except KeyError:
                 return self._expired_page()
             return _security_headers(RedirectResponse(target, status_code=302))
+
+        # Only an explicit "approve" can grant. Treating "anything but deny" as
+        # approval let a forged/garbage action ride a valid owner code into a
+        # grant; require the exact action and reject everything else with a 400
+        # before any code is minted.
+        if action != "approve":
+            return self._form_page(txn, error="Invalid action.", status=400)
 
         # A correct owner code is ALWAYS honoured, before any throttling check,
         # so wrong-attempt limits cannot lock out the legitimate owner.

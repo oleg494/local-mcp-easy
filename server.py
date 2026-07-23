@@ -5,7 +5,6 @@ import contextlib
 import datetime as dt
 import fnmatch
 import functools
-import hmac
 import json
 import os
 import re
@@ -21,6 +20,7 @@ from urllib.parse import urlsplit
 from core import (
     DEFAULT_ALLOWED_COMMANDS,
     DEFAULT_EXCLUDES,
+    _consteq,
     normalized_program_name,
     resolve_program,
     safe_path,
@@ -226,6 +226,29 @@ def tool(scope: str):
 
 def _path(value: str = ".") -> Path:
     return safe_path(BASE_DIR, value)
+
+
+def _ensure_writable(path: Path) -> None:
+    """Reject writes to git-policy trust anchors.
+
+    safe_path only proves a target stays inside the workspace; it does not stop
+    a client from forging the repo-context file (which fakes an approved repo
+    context) or rewriting git's own metadata under .git/ (e.g. .git/config).
+    Both are trust anchors the git policy depends on, so every mutating file
+    tool routes its target(s) through here.
+    """
+    if path.name == REPO_CONTEXT_FILE:
+        raise ValueError(
+            f"Refusing to modify the repo-context trust anchor '{REPO_CONTEXT_FILE}'. "
+            "Use setup_git_context(...) / configure_repo_context(...) instead."
+        )
+    # Inspect components inside the workspace only (".git" is listed in EXCLUDES).
+    try:
+        parts = path.relative_to(BASE_DIR).parts
+    except ValueError:
+        parts = path.parts
+    if ".git" in parts:
+        raise ValueError("Refusing to modify anything inside a .git directory.")
 
 
 def _is_binary_bytes(data: bytes) -> bool:
@@ -569,6 +592,26 @@ def _split_git_global_args(git_args: list[str]) -> tuple[list[str], str]:
     return prefix, subcommand
 
 
+def _sanitized_env() -> dict[str, str]:
+    """Return os.environ minus server secrets, for child processes.
+
+    Child processes (allow-listed commands + git subprocesses) must never
+    inherit the server's own credentials. Drop the legacy bearer token and every
+    OAuth owner secret (owner code, granted scopes, and any future MCP_OAUTH_*
+    key) while keeping the rest of the environment (PATH, HOME, ...) intact.
+    """
+    secret_keys = {
+        "MCP_TOKEN",
+        "MCP_OAUTH_OWNER_CODE",
+        "MCP_OAUTH_OWNER_GRANT_SCOPES",
+    }
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in secret_keys and not key.startswith("MCP_OAUTH_")
+    }
+
+
 def _run_git_query(
     cwd: Path,
     *args: str,
@@ -587,6 +630,7 @@ def _run_git_query(
         errors="replace",
         timeout=timeout,
         check=False,
+        env=_sanitized_env(),
     )
 
 
@@ -601,6 +645,7 @@ def _run_git_checked(cwd: Path, *args: str, timeout: int = 15) -> subprocess.Com
         errors="replace",
         timeout=timeout,
         check=False,
+        env=_sanitized_env(),
     )
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "unknown error").strip()
@@ -1175,6 +1220,33 @@ def _split_git_command(git_args: list[str]) -> tuple[list[str], str, list[str]]:
     return prefix, "", []
 
 
+# Global git prefix options that either run an arbitrary program (-c/--config-env
+# can set core.editor / core.sshCommand / credential.helper, --exec-path relocates
+# the git binary directory) or retarget git outside the validated workspace
+# (-C, --git-dir, --work-tree, --namespace). None may originate from a client.
+_UNSAFE_GIT_GLOBAL_OPTIONS = {
+    "-c",
+    "--config-env",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--exec-path",
+    "--namespace",
+}
+
+
+def _reject_unsafe_git_global_options(prefix: list[str]) -> None:
+    for arg in prefix:
+        # `--opt=value` and bare `--opt` share the same policy decision.
+        base = arg.split("=", 1)[0]
+        if base in _UNSAFE_GIT_GLOBAL_OPTIONS:
+            raise ValueError(
+                "Git is blocked because the global option "
+                f"'{base}' can run arbitrary programs or retarget git outside "
+                "the validated workspace."
+            )
+
+
 def _command_positionals(args: list[str], options_with_value: set[str] | None = None) -> list[str]:
     options_with_value = options_with_value or set()
     positionals: list[str] = []
@@ -1252,7 +1324,12 @@ def _require_current_branch_matches(current_branch: str, target_branch: str) -> 
 
 
 def _is_git_config_read_only(args: list[str]) -> bool:
-    mutating_flags = {"--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section"}
+    # `--edit`/`-e` opens the config in $EDITOR, which is attacker-controllable
+    # and executes an arbitrary program, so it must never count as read-only.
+    mutating_flags = {
+        "--add", "--replace-all", "--unset", "--unset-all",
+        "--remove-section", "--rename-section", "--edit", "-e",
+    }
     if any(flag in args for flag in mutating_flags):
         return False
     positionals = _command_positionals(args, {"-f", "--file", "--type", "--default", "--blob", "--fixed-value", "--url"})
@@ -1372,8 +1449,18 @@ def _effective_push_remote(
 
 
 def _blocked_push_mode(args: list[str]) -> str:
-    blocked = {"--all", "--mirror", "--tags", "--delete", "-d", "--prune"}
-    return next((arg for arg in args if arg in blocked), "")
+    # Force flags (-f/--force/--force-with-lease) can overwrite remote history;
+    # the multi-ref modes update/delete refs outside the branch policy. Match on
+    # the option base so `--force-with-lease=<ref>` is caught too.
+    blocked = {
+        "--all", "--mirror", "--tags", "--delete", "-d", "--prune",
+        "-f", "--force", "--force-with-lease",
+    }
+    for arg in args:
+        base = arg.split("=", 1)[0]
+        if base in blocked:
+            return base
+    return ""
 
 
 def _pull_remote_and_branch(args: list[str]) -> tuple[str, str]:
@@ -1383,23 +1470,72 @@ def _pull_remote_and_branch(args: list[str]) -> tuple[str, str]:
     return remote, branch
 
 
+_FETCH_OPTIONS_WITH_VALUE = {
+    "--depth", "--deepen", "--shallow-since", "--shallow-exclude",
+    "--refmap", "--filter", "-o", "--server-option", "--upload-pack",
+}
+
+
 def _fetch_remote(args: list[str]) -> str:
     if "--all" in args:
         return "__ALL__"
-    positionals = _command_positionals(args, {"--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--refmap", "--filter", "-o", "--server-option", "--upload-pack"})
+    positionals = _command_positionals(args, _FETCH_OPTIONS_WITH_VALUE)
     return positionals[0] if positionals else ""
 
 
+def _fetch_refspecs(args: list[str]) -> list[str]:
+    # Everything after the remote is a refspec (src[:dst]).
+    positionals = _command_positionals(args, _FETCH_OPTIONS_WITH_VALUE)
+    return positionals[1:]
+
+
+def _local_ref_branch(ref: str) -> str:
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
 def _refspec_target_branch(refspec: str, current_branch: str) -> str:
-    target = refspec
+    # A leading '+' forces a non-fast-forward update and can clobber history.
+    if refspec.startswith("+"):
+        raise ValueError(
+            "Git is blocked because a forced-update refspec ('+...') can "
+            "overwrite refs outside the configured branch policy."
+        )
+    source = target = refspec
     if ":" in refspec:
-        target = refspec.split(":", 1)[1]
-    target = target.lstrip("+")
+        source, target = refspec.split(":", 1)
+        # An empty source (':branch') is delete-branch syntax.
+        if source == "":
+            raise ValueError(
+                "Git is blocked because an empty-source refspec (':branch') "
+                "deletes a remote branch, which the branch policy forbids."
+            )
     if target in {"", "HEAD"}:
         return current_branch
-    if target.startswith("refs/heads/"):
-        return target[len("refs/heads/") :]
-    return target
+    return _local_ref_branch(target)
+
+
+def _ensure_transport_refspec_allowed(
+    refspec: str, target_branch: str, *, context: str
+) -> None:
+    """Validate a fetch/pull refspec's local-ref destination.
+
+    A refspec 'src:dst' on fetch/pull writes the local ref 'dst'. Reject forced
+    updates ('+...') and any refspec whose local destination is a ref other than
+    the configured target branch, so a client cannot forge arbitrary local refs.
+    """
+    if refspec.startswith("+"):
+        raise ValueError(
+            f"Git is blocked because {context} with a forced-update refspec "
+            "('+...') can overwrite local refs."
+        )
+    if ":" not in refspec:
+        return
+    _, dst = refspec.split(":", 1)
+    if _local_ref_branch(dst) != target_branch:
+        raise ValueError(
+            f"Git is blocked because {context} may only update the "
+            f"{target_branch} local branch, but the refspec targets {dst}."
+        )
 
 
 def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None) -> None:
@@ -1410,7 +1546,10 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
     if config is None:
         raise ValueError("Git is blocked because repo context data is unavailable.")
 
-    _, subcommand, tail = _split_git_command(git_args)
+    git_prefix, subcommand, tail = _split_git_command(git_args)
+    # Reject dangerous global prefix options before any subcommand-specific
+    # policy runs: they can execute arbitrary programs or move git's cwd.
+    _reject_unsafe_git_global_options(git_prefix)
     if not subcommand:
         raise ValueError("Git is blocked because the command could not be classified safely.")
 
@@ -1500,17 +1639,22 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
                 _ensure_remote_reference_allowed(remote_name, config, detected, context="git fetch --all")
             return
         _ensure_remote_reference_allowed(remote_target, config, detected, context="git fetch")
+        for refspec in _fetch_refspecs(tail):
+            _ensure_transport_refspec_allowed(refspec, target_branch, context="git fetch")
         return
 
     if subcommand == "pull":
         _require_current_branch_matches(current_branch, target_branch)
         remote_target, branch_target = _pull_remote_and_branch(tail)
         _ensure_remote_reference_allowed(remote_target, config, detected, context="git pull")
-        if branch_target and branch_target != target_branch:
-            raise ValueError(
-                f"Git is blocked because pull for this workspace must stay on {target_branch}, "
-                f"but the command targets {branch_target}."
-            )
+        if branch_target:
+            _ensure_transport_refspec_allowed(branch_target, target_branch, context="git pull")
+            # A bare remote branch (no ':') must still be the configured target.
+            if ":" not in branch_target and _local_ref_branch(branch_target) != target_branch:
+                raise ValueError(
+                    f"Git is blocked because pull for this workspace must stay on {target_branch}, "
+                    f"but the command targets {branch_target}."
+                )
         return
 
     if subcommand == "push":
@@ -1969,7 +2113,6 @@ async def setup_git_context(
 
 @tool(scope=SCOPE_FILES_READ)
 async def list_dir(
-
     path: str = ".",
     recursive: bool = False,
     include_hidden: bool = False,
@@ -1977,56 +2120,66 @@ async def list_dir(
 ) -> str:
     """List files inside the workspace. Large dependency/cache folders are skipped."""
     root = _path(path)
-    if not root.is_dir():
-        raise ValueError(f"Not a directory: {root}")
     limit = max(1, min(max_results, MAX_RESULTS))
-    rows: list[str] = []
 
-    if not recursive:
-        for item in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if should_skip(item, include_hidden, EXCLUDES):
-                continue
-            kind = "DIR" if item.is_dir() else f"{item.stat().st_size:,} B"
-            rows.append(f"{kind:>12}  {item.name}")
-            if len(rows) >= limit:
-                break
-    else:
-        for current, dirs, files in os.walk(root):
-            current_path = Path(current)
-            dirs[:] = sorted(
-                d
-                for d in dirs
-                if not should_skip(current_path / d, include_hidden, EXCLUDES)
-            )
-            for name in sorted(files):
-                item = current_path / name
+    # Recursive os.walk + per-entry stat() is blocking I/O; run it off the event
+    # loop so slow/large trees cannot stall every other in-flight request.
+    def _list() -> str:
+        if not root.is_dir():
+            raise ValueError(f"Not a directory: {root}")
+        rows: list[str] = []
+        if not recursive:
+            for item in sorted(root.iterdir(), key=lambda p: p.name.lower()):
                 if should_skip(item, include_hidden, EXCLUDES):
                     continue
-                rows.append(str(item.relative_to(root)))
+                kind = "DIR" if item.is_dir() else f"{item.stat().st_size:,} B"
+                rows.append(f"{kind:>12}  {item.name}")
                 if len(rows) >= limit:
                     break
-            if len(rows) >= limit:
-                break
+        else:
+            for current, dirs, files in os.walk(root):
+                current_path = Path(current)
+                dirs[:] = sorted(
+                    d
+                    for d in dirs
+                    if not should_skip(current_path / d, include_hidden, EXCLUDES)
+                )
+                for name in sorted(files):
+                    item = current_path / name
+                    if should_skip(item, include_hidden, EXCLUDES):
+                        continue
+                    rows.append(str(item.relative_to(root)))
+                    if len(rows) >= limit:
+                        break
+                if len(rows) >= limit:
+                    break
 
-    if not rows:
-        return "Directory is empty."
-    suffix = f"\n... limited to {limit} results" if len(rows) >= limit else ""
-    return _direct_or_saved_output("list-dir", "\n".join(rows) + suffix)
+        if not rows:
+            return "Directory is empty."
+        suffix = f"\n... limited to {limit} results" if len(rows) >= limit else ""
+        return _direct_or_saved_output("list-dir", "\n".join(rows) + suffix)
+
+    return await asyncio.to_thread(_list)
 
 
 @tool(scope=SCOPE_FILES_READ)
 async def file_info(path: str) -> str:
     """Show file or directory metadata."""
     item = _path(path)
-    if not item.exists():
-        return f"Not found: {path}"
-    stat = item.stat()
-    kind = "directory" if item.is_dir() else "file"
-    modified = dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-    return (
-        f"path: {item.relative_to(BASE_DIR)}\ntype: {kind}\n"
-        f"size: {stat.st_size:,}\nmodified: {modified}"
-    )
+
+    # exists()/stat() are blocking syscalls; keep them off the event loop.
+    def _info() -> str:
+        if not item.exists():
+            return f"Not found: {path}"
+        stat = item.stat()
+        kind = "directory" if item.is_dir() else "file"
+        modified = dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+        return (
+            f"path: {item.relative_to(BASE_DIR)}\ntype: {kind}\n"
+            f"size: {stat.st_size:,}\nmodified: {modified}"
+        )
+
+    return await asyncio.to_thread(_info)
 
 
 @tool(scope=SCOPE_FILES_READ)
@@ -2068,6 +2221,7 @@ async def write_file(path: str, content: str, overwrite: bool = True) -> str:
     if encoded_size > MAX_WRITE:
         raise ValueError(f"Content exceeds {MAX_WRITE:,} bytes")
     item = _path(path)
+    _ensure_writable(item)
     if item.exists() and not overwrite:
         raise ValueError(f"File already exists: {path}")
 
@@ -2086,6 +2240,7 @@ async def append_file(path: str, content: str) -> str:
     if encoded_size > MAX_WRITE:
         raise ValueError(f"Content exceeds {MAX_WRITE:,} bytes")
     item = _path(path)
+    _ensure_writable(item)
     current_size = item.stat().st_size if item.exists() else 0
     if current_size + encoded_size > MAX_TEXT_FILE:
         raise ValueError(f"Resulting file would exceed {MAX_TEXT_FILE:,} bytes")
@@ -2108,6 +2263,7 @@ async def edit_file(
 ) -> str:
     """Replace exact text in a UTF-8 file. Read the file first."""
     item = _path(path)
+    _ensure_writable(item)
     _text_file(item)
 
     def _edit() -> int:
@@ -2141,6 +2297,7 @@ async def edit_file(
 async def create_dir(path: str) -> str:
     """Create a directory and missing parents. Existing directories are accepted."""
     item = _path(path)
+    _ensure_writable(item)
     await asyncio.to_thread(item.mkdir, parents=True, exist_ok=True)
     return f"Directory ready: {item.relative_to(BASE_DIR)}"
 
@@ -2149,6 +2306,7 @@ async def create_dir(path: str) -> str:
 async def delete_file(path: str) -> str:
     """Delete one file or one empty directory. Recursive deletion is unavailable."""
     item = _path(path)
+    _ensure_writable(item)
     if not item.exists():
         return f"Not found: {path}"
     if item.is_dir():
@@ -2162,6 +2320,7 @@ async def delete_file(path: str) -> str:
 async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Copy one file inside the workspace."""
     source, target = _path(src), _path(dst)
+    _ensure_writable(target)
     if not source.is_file():
         raise ValueError(f"Source is not a file: {src}")
     if target.exists() and not overwrite:
@@ -2175,6 +2334,9 @@ async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
 async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Move or rename one file inside the workspace."""
     source, target = _path(src), _path(dst)
+    # Guard both ends: moving the anchor away removes it; moving onto it forges it.
+    _ensure_writable(source)
+    _ensure_writable(target)
     if not source.is_file():
         raise ValueError(f"Source is not a file: {src}")
     if target.exists() and not overwrite:
@@ -2189,15 +2351,21 @@ async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> s
     """Find workspace files using a glob such as **/*.py."""
     root = _path(path)
     limit = max(1, min(max_results, MAX_RESULTS))
-    rows: list[str] = []
-    for item in root.glob(pattern):
-        if not item.is_file() or any(part in EXCLUDES for part in item.parts):
-            continue
-        safe_path(BASE_DIR, item)
-        rows.append(str(item.relative_to(root)))
-        if len(rows) >= limit:
-            break
-    return "\n".join(sorted(rows)) if rows else "No files matched."
+
+    # Glob expansion walks the filesystem and stat()s each match; run it in a
+    # worker thread so it does not block the event loop like grep_files does.
+    def _glob() -> str:
+        rows: list[str] = []
+        for item in root.glob(pattern):
+            if not item.is_file() or any(part in EXCLUDES for part in item.parts):
+                continue
+            safe_path(BASE_DIR, item)
+            rows.append(str(item.relative_to(root)))
+            if len(rows) >= limit:
+                break
+        return "\n".join(sorted(rows)) if rows else "No files matched."
+
+    return await asyncio.to_thread(_glob)
 
 
 @tool(scope=SCOPE_FILES_READ)
@@ -2337,6 +2505,7 @@ async def _spawn_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=flags,
+        env=_sanitized_env(),
     )
 
 
@@ -2706,7 +2875,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if not _host_allowed(request.headers.get("host", "")):
             return JSONResponse({"error": "forbidden host"}, status_code=403)
         incoming = _extract_token(request)
-        if not incoming or not hmac.compare_digest(incoming, TOKEN):
+        if not incoming or not _consteq(incoming, TOKEN):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if request.url.path == "/health":
             return JSONResponse({"status": "ok"})
@@ -2848,7 +3017,7 @@ if OAUTH_ENABLED:
         # Operator endpoint for the launcher: accepts the master token in
         # every mode, even when /mcp itself is OAuth-only.
         incoming = _extract_token(request)
-        if not incoming or not hmac.compare_digest(incoming, TOKEN):
+        if not incoming or not _consteq(incoming, TOKEN):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return JSONResponse({"status": "ok"})
 
