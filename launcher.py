@@ -8,6 +8,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -547,6 +548,30 @@ def pid_exists(pid: int) -> bool:
         return False
 
 
+TUNNEL_BACKOFF_START_SECONDS = 3.0
+TUNNEL_BACKOFF_MAX_SECONDS = 300.0
+
+
+def ensure_config_dir() -> None:
+    """Create the per-user config directory with owner-only permissions.
+
+    It stores the Bearer token, OAuth owner code and runtime state, so on shared
+    POSIX hosts it must not be group/world readable. chmod only affects the
+    POSIX mode bits; on Windows %LOCALAPPDATA% is already per-user via ACLs.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(CONFIG_DIR, 0o700)
+
+
+def tunnel_backoff_delay(attempt: int) -> float:
+    """Exponential reconnect backoff: 3s, 6s, 12s ... capped at 5 minutes."""
+    if attempt < 1:
+        return 0.0
+    delay = TUNNEL_BACKOFF_START_SECONDS * (2 ** (attempt - 1))
+    return min(delay, TUNNEL_BACKOFF_MAX_SECONDS)
+
+
 def process_command_line(pid: int) -> str:
     if not pid_exists(pid):
         return ""
@@ -566,9 +591,25 @@ def process_command_line(pid: int) -> str:
             check=False,
         )
         return result.stdout.strip()
-    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    # open() (unlike pathlib.Path) does not pick a path flavour from os.name,
+    # which keeps this testable when os.name is patched to "posix".
     with contextlib.suppress(OSError):
-        return proc_cmdline.read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
+        if raw:
+            return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+    # macOS/BSD have no /proc; fall back to ps (also covers Linux PIDs whose
+    # cmdline is empty, e.g. zombies or kernel threads).
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
     return ""
 
 
@@ -577,7 +618,18 @@ def pid_matches(pid: int, expected: str) -> bool:
     return bool(command_line) and expected.lower() in command_line.lower()
 
 
-def stop_pid(pid: int, expected: str) -> bool:
+def _wait_until_gone(pid: int, timeout: float = 5.0, interval: float = 0.1) -> bool:
+    """Poll until the PID disappears or the timeout elapses; return liveness."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if not pid_exists(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return not pid_exists(pid)
+        time.sleep(interval)
+
+
+def stop_pid(pid: int, expected: str, timeout: float = 5.0) -> bool:
     if not pid_exists(pid):
         return True
     if not pid_matches(pid, expected):
@@ -590,10 +642,16 @@ def stop_pid(pid: int, expected: str) -> bool:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    else:
-        with contextlib.suppress(OSError):
-            os.kill(pid, 15)
-    return True
+        return _wait_until_gone(pid, timeout=timeout)
+    # POSIX: request graceful shutdown, wait, then escalate to SIGKILL so a
+    # wedged process cannot survive stop.
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    if _wait_until_gone(pid, timeout=timeout):
+        return True
+    with contextlib.suppress(OSError):
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    return _wait_until_gone(pid, timeout=timeout)
 
 
 def stop_all() -> None:
@@ -721,7 +779,7 @@ def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
             "PYTHONUNBUFFERED": "1",
         }
     )
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_config_dir()
     log = SERVER_LOG.open("w", encoding="utf-8")
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
@@ -849,6 +907,7 @@ def resolve_tunnel_url(
 
 
 def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int) -> None:
+    ensure_config_dir()
     endpoint = url.rstrip("/") + "/mcp"
     runtime = {
         "version": VERSION,
@@ -979,22 +1038,30 @@ def run() -> int:
             raise tunnel_error(f"Public health check failed: {url}/health did not answer")
         publish_connection(config, url, server.pid, tunnel.pid)
 
+        reconnect_attempt = 0
         while True:
             if server.poll() is not None:
                 raise RuntimeError(
                     f"MCP server stopped with code {server.returncode}; see {SERVER_LOG}"
                 )
             if tunnel.poll() is not None:
-                print("Tunnel disconnected; reconnecting in 3 seconds...")
-                time.sleep(3)
+                reconnect_attempt += 1
+                delay = tunnel_backoff_delay(reconnect_attempt)
+                print(
+                    f"Tunnel disconnected; reconnecting in {int(delay)} seconds "
+                    f"(attempt {reconnect_attempt})..."
+                )
+                time.sleep(delay)
                 tunnel, lines = start_tunnel(config)
                 url = resolve_tunnel_url(config, tunnel, lines)
                 healthy = public_health_ok(url, config["token"], process=tunnel)
                 publish_connection(config, url, server.pid, tunnel.pid)
                 if not healthy:
                     print(f"WARNING: {url}/health is not answering yet; keeping the tunnel up and retrying on next disconnect.")
-                elif config.get("serveo_hostname"):
-                    print("Stable Serveo tunnel restored with the same URL.")
+                else:
+                    reconnect_attempt = 0
+                    if config.get("serveo_hostname"):
+                        print("Stable Serveo tunnel restored with the same URL.")
                 if not config.get("serveo_hostname"):
                     print("IMPORTANT: the tunnel URL changed. Update the MCP server URL in your client.")
             time.sleep(1)
