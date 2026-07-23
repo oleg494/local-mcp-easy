@@ -140,13 +140,17 @@ class OAuthClientDriver:
     def __init__(self, base: str):
         self.base = base
 
-    def register(self, scope: str | None = None) -> dict:
+    def register(
+        self,
+        scope: str | None = None,
+        token_endpoint_auth_method: str = "none",
+    ) -> dict:
         payload = {
             "client_name": "integration-test-client",
             "redirect_uris": [CALLBACK],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
+            "token_endpoint_auth_method": token_endpoint_auth_method,
         }
         if scope is not None:
             payload["scope"] = scope
@@ -193,20 +197,23 @@ class OAuthClientDriver:
             FORM_HEADERS,
         )
 
-    def exchange(self, client: dict, code: str, verifier: str):
-        return http(
-            f"{self.base}/token",
-            form(
-                {
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": CALLBACK,
-                    "client_id": client["client_id"],
-                    "code_verifier": verifier,
-                }
-            ),
-            FORM_HEADERS,
-        )
+    def exchange(
+        self,
+        client: dict,
+        code: str,
+        verifier: str,
+        client_secret: str | None = None,
+    ):
+        payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": CALLBACK,
+            "client_id": client["client_id"],
+            "code_verifier": verifier,
+        }
+        if client_secret is not None:
+            payload["client_secret"] = client_secret
+        return http(f"{self.base}/token", form(payload), FORM_HEADERS)
 
     def obtain_tokens(self, scope: str | None = None, state: str = "state-1") -> dict:
         client = self.register(scope)
@@ -423,6 +430,29 @@ class OAuthModeTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertIn("Not found: evil.txt", json.dumps(payload))
 
+    def test_07a_rotated_access_token_works_without_replay(self):
+        # Sanity: a single legitimate rotation (no replay of the old token)
+        # leaves the newly-issued access token fully usable.
+        tokens = self.driver.obtain_tokens()
+        client = tokens["_client"]
+        base = self.server.base
+
+        status, _, body = http(
+            f"{base}/token",
+            form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": tokens["refresh_token"],
+                    "client_id": client["client_id"],
+                }
+            ),
+            FORM_HEADERS,
+        )
+        self.assertEqual(status, 200)
+        rotated = json.loads(body)
+        status, _, _ = http(f"{base}/mcp", INITIALIZE, mcp_headers(rotated["access_token"]))
+        self.assertEqual(status, 200)
+
     def test_07_refresh_rotation_and_revocation(self):
         tokens = self.driver.obtain_tokens()
         client = tokens["_client"]
@@ -458,11 +488,29 @@ class OAuthModeTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("invalid_grant", body)
 
-        # The access token issued together with it is dead as well.
+        # Replaying the rotated-out token is treated as reuse (RFC 9700
+        # section 4.14.2): the ENTIRE family is revoked, including the
+        # access/refresh tokens issued by the rotation above.
         status, _, _ = http(f"{base}/mcp", INITIALIZE, mcp_headers(tokens["access_token"]))
         self.assertEqual(status, 401)
         status, _, _ = http(f"{base}/mcp", INITIALIZE, mcp_headers(rotated["access_token"]))
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 401)
+
+        # The family is dead: even the latest refresh token can no longer be
+        # redeemed for new tokens.
+        status, _, body = http(
+            f"{base}/token",
+            form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": rotated["refresh_token"],
+                    "client_id": client["client_id"],
+                }
+            ),
+            FORM_HEADERS,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("invalid_grant", body)
 
         # Revocation kills the rotated access token.
         status, _, _ = http(
@@ -517,6 +565,58 @@ class OAuthModeTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn("access_token", json.loads(body))
+
+    def _fresh_code(self, client: dict, state: str):
+        verifier, challenge = pkce_pair()
+        txn, csrf = self.driver.authorize_to_consent(client, challenge, state)
+        status, headers, _ = self.driver.approve(txn, csrf)
+        self.assertEqual(status, 302)
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(headers["Location"]).query
+        )
+        return query["code"][0], verifier
+
+    def test_10_confidential_client_secret_is_enforced(self):
+        # A confidential client (client_secret_post) gets a plaintext secret in
+        # its one-time DCR response; that secret is then required at /token.
+        client = self.driver.register(
+            token_endpoint_auth_method="client_secret_post"
+        )
+        secret = client.get("client_secret")
+        self.assertTrue(secret, "DCR response must disclose the client_secret once")
+
+        # Wrong secret is rejected as invalid_client without consuming the code.
+        code, verifier = self._fresh_code(client, "conf-wrong")
+        status, _, body = self.driver.exchange(
+            client, code, verifier, client_secret="not-the-real-secret"
+        )
+        self.assertIn(status, (400, 401))
+        self.assertIn("invalid_client", body)
+
+        # Missing secret entirely is likewise rejected.
+        code, verifier = self._fresh_code(client, "conf-missing")
+        status, _, body = self.driver.exchange(client, code, verifier)
+        self.assertIn(status, (400, 401))
+        self.assertIn("invalid_client", body)
+
+        # Correct secret succeeds and mints tokens.
+        code, verifier = self._fresh_code(client, "conf-right")
+        status, _, body = self.driver.exchange(
+            client, code, verifier, client_secret=secret
+        )
+        self.assertEqual(status, 200, body)
+        tokens = json.loads(body)
+        self.assertTrue(tokens["access_token"].startswith("mcp_at_"))
+
+    def test_11_public_client_authenticates_without_secret(self):
+        # A public client (token_endpoint_auth_method=none) is untouched by the
+        # secret-enforcing middleware and still completes the flow.
+        tokens = self.driver.obtain_tokens()
+        self.assertTrue(tokens["access_token"].startswith("mcp_at_"))
+        status, _, _ = http(
+            f"{self.server.base}/mcp", INITIALIZE, mcp_headers(tokens["access_token"])
+        )
+        self.assertEqual(status, 200)
 
 
 class DualModeTests(unittest.TestCase):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import datetime as dt
 import fnmatch
@@ -15,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from core import (
     DEFAULT_ALLOWED_COMMANDS,
@@ -27,6 +29,7 @@ from core import (
     should_skip,
 )
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.routes import TOKEN_PATH
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -50,6 +53,7 @@ from auth import (
     protected_resource_document,
     resource_url_for,
 )
+from auth.oauth import hash_client_secret
 
 TOKEN = os.environ.get("MCP_TOKEN", "").strip()
 BASE_DIR = Path(os.environ.get("MCP_BASE_DIR", str(Path.home() / "Documents"))).resolve()
@@ -2996,6 +3000,84 @@ class AuthorizeHintMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _presented_client_secret(request, form, client_id: str, auth_method: str) -> str | None:
+    """Extract the client_secret a /token request presents, mirroring exactly how
+    the SDK's ClientAuthenticator reads it for each registered auth method
+    (RFC 6749 2.3.1 Basic header, or the client_secret_post form field)."""
+    if auth_method == "client_secret_basic":
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Basic "):
+            return None
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            return None
+        if ":" not in decoded:
+            return None
+        basic_client_id, secret = decoded.split(":", 1)
+        # URL-decode both parts per RFC 6749 Section 2.3.1.
+        if unquote(basic_client_id) != client_id:
+            return None
+        return unquote(secret)
+    if auth_method == "client_secret_post":
+        raw = form.get("client_secret")
+        return raw if isinstance(raw, str) else None
+    return None
+
+
+class ClientSecretAuthMiddleware(BaseHTTPMiddleware):
+    """Enforce confidential-client secret authentication on POST /token.
+
+    Client secrets are persisted only as SHA-256 hashes (auth/oauth.py), so the
+    SDK's own ClientAuthenticator — which compares the presented secret against
+    whatever get_client() returns — can no longer verify them; get_client
+    deliberately returns client_secret=None so that comparison is always
+    skipped. This middleware is therefore the sole real enforcer: it looks up
+    the client's stored secret hash, hashes the presented secret the same way,
+    and compares them in constant time.
+
+    A public client (no stored secret) is passed straight through untouched, so
+    the SDK's own none/secret_post/basic logic runs unmodified for it. A
+    confidential client presenting a wrong or missing secret is rejected here
+    with an invalid_client error and never reaches the SDK handler (so the
+    authorization code / refresh token it targeted is left unconsumed)."""
+
+    async def dispatch(self, request, call_next):
+        if request.method != "POST" or request.url.path != TOKEN_PATH:
+            return await call_next(request)
+        assert oauth_provider is not None
+        try:
+            # Buffer the raw body first so Starlette caches it on the request;
+            # otherwise reading the urlencoded form here consumes the ASGI
+            # receive stream and the downstream SDK TokenHandler would see an
+            # empty body ("Missing client_id"). With _body cached, the
+            # BaseHTTPMiddleware replays the full body to the SDK handler.
+            await request.body()
+            form = await request.form()
+        except Exception:
+            # Malformed body: let the SDK produce its own error response.
+            return await call_next(request)
+        client_id = form.get("client_id")
+        if not isinstance(client_id, str) or not client_id:
+            return await call_next(request)
+        stored = oauth_provider.store.clients.get(client_id)
+        secret_hash = stored.get("client_secret") if isinstance(stored, dict) else None
+        if not secret_hash:
+            # Public/unknown client: nothing to enforce here.
+            return await call_next(request)
+        auth_method = str(stored.get("token_endpoint_auth_method") or "")
+        presented = _presented_client_secret(request, form, client_id, auth_method)
+        if not presented or not _consteq(hash_client_secret(presented), secret_hash):
+            return JSONResponse(
+                {
+                    "error": "invalid_client",
+                    "error_description": "client authentication failed",
+                },
+                status_code=401,
+            )
+        return await call_next(request)
+
+
 if OAUTH_ENABLED:
     assert oauth_provider is not None
     _consent_handler = ConsentHandler(
@@ -3050,6 +3132,10 @@ if __name__ == "__main__":
         # Added before HostCheckMiddleware so host validation stays outermost;
         # this only rewrites the SDK's raw 400 on a parameter-less /authorize.
         app.add_middleware(AuthorizeHintMiddleware)
+        # Enforce confidential-client secrets on /token, since secrets are stored
+        # only as hashes and the SDK's own comparison can no longer verify them.
+        # Applies in oauth and dual modes (both expose the SDK's /token route).
+        app.add_middleware(ClientSecretAuthMiddleware)
         app.add_middleware(HostCheckMiddleware)
     print(f"{SERVER_NAME} {SERVER_VERSION}: http://127.0.0.1:{PORT}/mcp")
     print(f"Workspace: {BASE_DIR}")

@@ -189,11 +189,32 @@ class ProviderFlowTests(ProviderTestBase):
         refresh = await self.provider.load_refresh_token(client, token.refresh_token)
         rotated = await self.provider.exchange_refresh_token(client, refresh, [])
         self.assertNotEqual(rotated.refresh_token, token.refresh_token)
-        self.assertIsNone(
-            await self.provider.load_refresh_token(client, token.refresh_token)
-        )
         self.assertIsNone(await self.provider.load_access_token(token.access_token))
         self.assertIsNotNone(await self.provider.load_access_token(rotated.access_token))
+        # NOTE: presenting the now-rotated OLD token again (even via a mere
+        # load, not just exchange) is reuse per RFC 9700 section 4.14.2 and
+        # revokes the whole family, including the just-issued `rotated` one —
+        # see RefreshTokenFamilyTests for that scenario. This test therefore
+        # does not re-load `token.refresh_token` after rotation.
+
+    async def test_old_refresh_token_cannot_be_exchanged_again_after_rotation(self):
+        # The old token is genuinely dead (can't mint more tokens with it),
+        # verified via exchange rather than load (load-after-rotation of the
+        # old token is itself treated as reuse — see RefreshTokenFamilyTests).
+        from mcp.server.auth.provider import RefreshToken
+
+        client = make_client()
+        _, token = await self._authorize_and_exchange(client)
+        refresh = await self.provider.load_refresh_token(client, token.refresh_token)
+        await self.provider.exchange_refresh_token(client, refresh, [])
+        forged_old = RefreshToken(
+            token=token.refresh_token,
+            client_id=client.client_id,
+            scopes=list(refresh.scopes),
+            expires_at=None,
+        )
+        with self.assertRaises(TokenError):
+            await self.provider.exchange_refresh_token(client, forged_old, [])
 
     async def test_refresh_cannot_widen_scopes(self):
         client = make_client(scope=SCOPE_FILES_READ)
@@ -771,6 +792,183 @@ class UsedCodeTests(ProviderTestBase):
         # A late replay after pruning is handled cleanly (no crash, no token).
         result = await self.provider.load_authorization_code(client, token.access_token)
         self.assertIsNone(result)
+
+
+class RefreshTokenFamilyTests(ProviderTestBase):
+    """RFC 9700 section 4.14.2: rotating refresh tokens form a family. Presenting
+    an already-rotated (replayed) token must revoke the ENTIRE family — including
+    the currently-valid latest descendant — not merely reject the replayed token.
+    """
+
+    async def _rotate(self, client, token):
+        refresh = await self.provider.load_refresh_token(client, token.refresh_token)
+        self.assertIsNotNone(refresh)
+        return await self.provider.exchange_refresh_token(client, refresh, [])
+
+    def _forge(self, client, token):
+        from mcp.server.auth.provider import RefreshToken
+
+        return RefreshToken(
+            token=token.refresh_token,
+            client_id=client.client_id,
+            scopes=list(ALL_SCOPES),
+            expires_at=None,
+        )
+
+    async def test_replaying_rotated_token_revokes_entire_family(self):
+        client = make_client()
+        _, token_a = await self._authorize_and_exchange(client)  # token A
+        token_b = await self._rotate(client, token_a)            # A -> B
+        # Sanity: B is currently usable.
+        self.assertIsNotNone(await self.provider.load_access_token(token_b.access_token))
+        # Replay A: rejected AND kills the whole family (including the live B).
+        self.assertIsNone(
+            await self.provider.load_refresh_token(client, token_a.refresh_token)
+        )
+        self.assertIsNone(
+            await self.provider.load_refresh_token(client, token_b.refresh_token)
+        )
+        self.assertIsNone(await self.provider.load_access_token(token_b.access_token))
+
+    async def test_legitimate_redeem_of_latest_fails_after_replay(self):
+        client = make_client()
+        _, token_a = await self._authorize_and_exchange(client)
+        token_b = await self._rotate(client, token_a)            # A -> B
+        # Attacker replays A -> whole family revoked.
+        self.assertIsNone(
+            await self.provider.load_refresh_token(client, token_a.refresh_token)
+        )
+        # The legitimate client's subsequent redeem of B must now fail too.
+        self.assertIsNone(
+            await self.provider.load_refresh_token(client, token_b.refresh_token)
+        )
+        with self.assertRaises(TokenError):
+            await self.provider.exchange_refresh_token(
+                client, self._forge(client, token_b), []
+            )
+
+    async def test_family_id_is_stable_across_rotation(self):
+        client = make_client()
+        _, token_a = await self._authorize_and_exchange(client)
+        families = {
+            record.get("family_id")
+            for record in self.provider.store.refresh_tokens.values()
+        }
+        self.assertEqual(len(families), 1)
+        self.assertNotIn(None, families)
+        family = families.pop()
+        await self._rotate(client, token_a)  # A -> B
+        after = {
+            record.get("family_id")
+            for record in self.provider.store.refresh_tokens.values()
+        }
+        # The rotated descendant carries the SAME family_id as its parent.
+        self.assertEqual(after, {family})
+
+    async def test_reuse_detected_through_exchange_path(self):
+        # Defensive: even reaching exchange_refresh_token directly with an
+        # already-rotated token must revoke the family, not just reject.
+        client = make_client()
+        _, token_a = await self._authorize_and_exchange(client)
+        token_b = await self._rotate(client, token_a)
+        with self.assertRaises(TokenError):
+            await self.provider.exchange_refresh_token(
+                client, self._forge(client, token_a), []
+            )
+        self.assertIsNone(await self.provider.load_access_token(token_b.access_token))
+
+    async def test_replay_of_oldest_token_after_two_rotations_kills_current(self):
+        # A -> B -> C: replaying the oldest link A still revokes the live C.
+        client = make_client()
+        _, token_a = await self._authorize_and_exchange(client)
+        token_b = await self._rotate(client, token_a)
+        token_c = await self._rotate(client, token_b)
+        self.assertIsNotNone(await self.provider.load_access_token(token_c.access_token))
+        self.assertIsNone(
+            await self.provider.load_refresh_token(client, token_a.refresh_token)
+        )
+        self.assertIsNone(await self.provider.load_access_token(token_c.access_token))
+
+    def test_rotated_refresh_markers_are_capped(self):
+        # Mirrors InMemoryCapTests: the rotated-token markers are bounded by
+        # count (not only TTL) so heavy rotation cannot grow them without limit.
+        import auth.oauth as oauth_mod
+
+        original = oauth_mod.MAX_ROTATED_REFRESH
+        oauth_mod.MAX_ROTATED_REFRESH = 5
+        try:
+            now = time.time()
+            for i in range(20):
+                self.provider._rotated_refresh[f"h{i}"] = (f"fam{i}", now + i)
+            self.provider._prune_rotated_refresh()
+            self.assertLessEqual(len(self.provider._rotated_refresh), 5)
+            # Newest markers survive; oldest are evicted.
+            self.assertIn("h19", self.provider._rotated_refresh)
+            self.assertNotIn("h0", self.provider._rotated_refresh)
+        finally:
+            oauth_mod.MAX_ROTATED_REFRESH = original
+
+    def test_rotated_refresh_markers_pruned_by_ttl(self):
+        import auth.oauth as oauth_mod
+
+        # Aged past the TTL, a marker is dropped on prune.
+        stale = time.time() - oauth_mod.ROTATED_REFRESH_TTL - 1
+        self.provider._rotated_refresh["old"] = ("fam", stale)
+        self.provider._rotated_refresh["fresh"] = ("fam2", time.time())
+        self.provider._prune_rotated_refresh()
+        self.assertNotIn("old", self.provider._rotated_refresh)
+        self.assertIn("fresh", self.provider._rotated_refresh)
+
+
+class ClientSecretStorageTests(ProviderTestBase):
+    """Confidential DCR clients must be persisted with only a SHA-256 hash of
+    their client_secret; the raw secret must never touch oauth_state.json, and
+    get_client must never hand the secret (raw or hashed) back to the SDK."""
+
+    def _confidential(self, secret: str, client_id: str = "confidential-1"):
+        return OAuthClientInformationFull.model_validate(
+            {
+                "client_id": client_id,
+                "client_secret": secret,
+                "client_id_issued_at": int(time.time()),
+                "redirect_uris": [REDIRECT],
+                "token_endpoint_auth_method": "client_secret_post",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "scope": " ".join(ALL_SCOPES),
+                "client_name": "Confidential client",
+            }
+        )
+
+    async def test_client_secret_is_hashed_at_rest(self):
+        from auth.oauth import hash_client_secret
+
+        secret = "super-secret-value-abc123-xyz"
+        await self.provider.register_client(self._confidential(secret))
+        raw = self.state_file.read_text(encoding="utf-8")
+        # The plaintext secret is nowhere in the persisted state file...
+        self.assertNotIn(secret, raw)
+        # ...but its hash is.
+        self.assertIn(hash_client_secret(secret), raw)
+
+    async def test_stored_secret_survives_reload_as_hash(self):
+        from auth.oauth import hash_client_secret
+
+        secret = "another-secret-value-42"
+        await self.provider.register_client(self._confidential(secret))
+        reloaded = self._make_provider()
+        self.assertEqual(
+            reloaded.store.clients["confidential-1"]["client_secret"],
+            hash_client_secret(secret),
+        )
+
+    async def test_get_client_never_exposes_secret(self):
+        await self.provider.register_client(self._confidential("hide-me-please"))
+        loaded = await self.provider.get_client("confidential-1")
+        self.assertIsNotNone(loaded)
+        # get_client always blanks the secret so the SDK's own ClientAuthenticator
+        # never compares against the stored hash.
+        self.assertIsNone(loaded.client_secret)
 
 
 class DefaultScopeTests(unittest.TestCase):

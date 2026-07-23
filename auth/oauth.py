@@ -13,7 +13,9 @@ Security properties:
 - Reuse of an already-exchanged authorization code revokes the tokens that
   were issued for it (RFC 6749 section 4.1.2 recommendation).
 - Refresh tokens rotate on every use; the previous refresh token and the
-  access tokens issued with it are invalidated.
+  access tokens issued with it are invalidated. Every token in a rotation
+  chain shares a family_id, and replaying an already-rotated token revokes the
+  whole family — the live descendant included (RFC 9700 section 4.14.2).
 - Access tokens are audience-bound to this server's /mcp resource URL
   (RFC 8707); tokens minted for another resource are rejected.
 - The static master token (dual mode) is compared in constant time and is
@@ -66,6 +68,12 @@ DEFAULT_UNUSED_CLIENT_TTL = 3600
 # /token calls cannot grow these in-memory maps without bound.
 MAX_PENDING_TXNS = 512
 MAX_USED_CODES = 4096
+# Reuse-detection markers for rotated refresh tokens (RFC 9700 section 4.14.2).
+# A rotated token can plausibly be replayed until it would have expired, so keep
+# its marker for the refresh-token lifetime; the count cap bounds memory under a
+# high rotation rate the same way MAX_USED_CODES bounds exchanged auth-codes.
+ROTATED_REFRESH_TTL = DEFAULT_REFRESH_TTL
+MAX_ROTATED_REFRESH = 4096
 
 ACCESS_PREFIX = "mcp_at_"
 REFRESH_PREFIX = "mcp_rt_"
@@ -73,6 +81,16 @@ REFRESH_PREFIX = "mcp_rt_"
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_client_secret(secret: str) -> str:
+    """SHA-256 hash of a DCR client_secret for storage/comparison.
+
+    Same SHA-256-over-utf8-hex scheme as access/refresh token hashing; kept as
+    a distinct, public name because it is the sole thing shared between the
+    OAuthStore (which hashes secrets at rest) and the server's
+    ClientSecretAuthMiddleware (which hashes the presented secret to compare)."""
+    return _hash_token(secret)
 
 
 def _now() -> float:
@@ -165,6 +183,20 @@ class OAuthStore:
             # Windows ACLs already restrict %LOCALAPPDATA% to the current user.
             pass
 
+    def store_client(self, client_id: str, record: dict[str, Any]) -> None:
+        """Persist a client record with any raw client_secret replaced by its
+        SHA-256 hash, so oauth_state.json never holds the plaintext secret.
+
+        The raw secret is disclosed to the client exactly once, in the DCR HTTP
+        response (which serializes the input object, not this stored copy);
+        secret correctness at /token is enforced by the server's
+        ClientSecretAuthMiddleware against the hash stored here."""
+        record = dict(record)
+        secret = record.get("client_secret")
+        if secret:
+            record["client_secret"] = hash_client_secret(secret)
+        self.clients[client_id] = record
+
     def prune(self) -> None:
         now = _now()
         self.access_tokens = {
@@ -229,6 +261,11 @@ class LocalOAuthProvider:
         self._codes: dict[str, AuthorizationCode] = {}
         # code -> (access_hash, refresh_hash, created_at) for replay revocation
         self._used_codes: dict[str, tuple[str, str, float]] = {}
+        # Reuse-detection markers for already-rotated refresh tokens: hash ->
+        # (family_id, rotated_at). Kept even after the token record itself is
+        # deleted so a later replay can still be recognized and the whole
+        # family revoked (RFC 9700 section 4.14.2).
+        self._rotated_refresh: dict[str, tuple[str, float]] = {}
 
     # ------------------------------------------------------------------
     # Client registry
@@ -302,7 +339,16 @@ class LocalOAuthProvider:
         raw = self.store.clients.get(client_id)
         if raw is None:
             return None
-        return OAuthClientInformationFull.model_validate(raw)
+        # The stored client_secret is a SHA-256 hash, never the raw value, and
+        # ClientSecretAuthMiddleware is now the sole real enforcer of secret
+        # correctness. Blank the secret here so the SDK's own ClientAuthenticator
+        # comparison (against get_client's return) is always skipped as falsy —
+        # which is safe, because a request lacking a valid secret is already
+        # rejected by the middleware before the SDK handler runs — and so the
+        # stored hash never leaks back out through get_client.
+        data = dict(raw)
+        data["client_secret"] = None
+        return OAuthClientInformationFull.model_validate(data)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self.validate_redirect_uris(client_info)
@@ -316,7 +362,9 @@ class LocalOAuthProvider:
                         "or try again later"
                     ),
                 )
-        self.store.clients[client_info.client_id] = client_info.model_dump(mode="json")
+        self.store.store_client(
+            client_info.client_id, client_info.model_dump(mode="json")
+        )
         self.store.save()
 
     # ------------------------------------------------------------------
@@ -371,6 +419,19 @@ class LocalOAuthProvider:
                 : len(self._used_codes) - MAX_USED_CODES
             ]:
                 self._used_codes.pop(code, None)
+
+    def _prune_rotated_refresh(self) -> None:
+        cutoff = _now() - ROTATED_REFRESH_TTL
+        self._rotated_refresh = {
+            token_hash: entry
+            for token_hash, entry in self._rotated_refresh.items()
+            if entry[1] > cutoff
+        }
+        if len(self._rotated_refresh) > MAX_ROTATED_REFRESH:
+            for token_hash in sorted(
+                self._rotated_refresh, key=lambda h: self._rotated_refresh[h][1]
+            )[: len(self._rotated_refresh) - MAX_ROTATED_REFRESH]:
+                self._rotated_refresh.pop(token_hash, None)
 
     def get_txn(self, txn_id: str) -> PendingAuthorization | None:
         self._prune_txns()
@@ -453,8 +514,37 @@ class LocalOAuthProvider:
             if value.get("refresh_parent") != refresh_hash
         }
 
+    def _prune_rotated_refresh(self) -> None:
+        cutoff = _now() - ROTATED_REFRESH_TTL
+        self._rotated_refresh = {
+            key: entry
+            for key, entry in self._rotated_refresh.items()
+            if entry[1] > cutoff
+        }
+        if len(self._rotated_refresh) > MAX_ROTATED_REFRESH:
+            for key in sorted(
+                self._rotated_refresh, key=lambda k: self._rotated_refresh[k][1]
+            )[: len(self._rotated_refresh) - MAX_ROTATED_REFRESH]:
+                self._rotated_refresh.pop(key, None)
+
+    def _revoke_family(self, family_id: str) -> None:
+        """RFC 9700 section 4.14.2: reuse of a rotated refresh token revokes
+        every token descended from its family, including the currently-valid
+        latest descendant, not merely the replayed token itself."""
+        if not family_id:
+            # Never mass-revoke on a missing family (would sweep legacy records).
+            return
+        dead = [
+            refresh_hash
+            for refresh_hash, record in self.store.refresh_tokens.items()
+            if record.get("family_id") == family_id
+        ]
+        for refresh_hash in dead:
+            self.refresh_and_children_forget(refresh_hash)
+        self.store.save()
+
     def _issue_tokens(
-        self, client_id: str, scopes: list[str]
+        self, client_id: str, scopes: list[str], family_id: str | None = None
     ) -> tuple[str, str, str, str]:
         access_token = ACCESS_PREFIX + secrets.token_urlsafe(32)
         refresh_token = REFRESH_PREFIX + secrets.token_urlsafe(32)
@@ -465,6 +555,7 @@ class LocalOAuthProvider:
             "client_id": client_id,
             "scopes": scopes,
             "expires_at": int(now + self.refresh_ttl),
+            "family_id": family_id or secrets.token_hex(16),
         }
         self.store.access_tokens[access_hash] = {
             "client_id": client_id,
@@ -507,8 +598,17 @@ class LocalOAuthProvider:
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        record = self.store.refresh_tokens.get(_hash_token(refresh_token))
-        if record is None or record.get("client_id") != client.client_id:
+        token_hash = _hash_token(refresh_token)
+        record = self.store.refresh_tokens.get(token_hash)
+        if record is None:
+            self._prune_rotated_refresh()
+            rotated = self._rotated_refresh.get(token_hash)
+            if rotated is not None:
+                # Replay of an already-rotated token: kill the whole family,
+                # including whatever descendant is currently live.
+                self._revoke_family(rotated[0])
+            return None
+        if record.get("client_id") != client.client_id:
             return None
         return RefreshToken(
             token=refresh_token,
@@ -524,7 +624,12 @@ class LocalOAuthProvider:
         scopes: list[str],
     ) -> OAuthToken:
         old_hash = _hash_token(refresh_token.token)
-        if old_hash not in self.store.refresh_tokens:
+        record = self.store.refresh_tokens.get(old_hash)
+        if record is None:
+            self._prune_rotated_refresh()
+            rotated = self._rotated_refresh.get(old_hash)
+            if rotated is not None:
+                self._revoke_family(rotated[0])
             raise TokenError(
                 error="invalid_grant", error_description="refresh token is not valid"
             )
@@ -534,10 +639,18 @@ class LocalOAuthProvider:
                 error="invalid_scope",
                 error_description="requested scopes exceed the original grant",
             )
-        # Rotation: the previous refresh token and its access tokens die here.
+        # A token loaded from a pre-family state file has no family_id; give it
+        # one now so the whole chain from this rotation onward is linked and a
+        # later replay never revokes on a None family.
+        family_id = record.get("family_id") or secrets.token_hex(16)
+        # Rotation: the previous refresh token and its access tokens die here,
+        # but a marker survives so a later replay of THIS token is still
+        # recognized as reuse even after the record itself is gone.
         self.refresh_and_children_forget(old_hash)
+        self._prune_rotated_refresh()
+        self._rotated_refresh[old_hash] = (family_id, _now())
         access_token, new_refresh_token, _, _ = self._issue_tokens(
-            client.client_id, granted
+            client.client_id, granted, family_id=family_id
         )
         return OAuthToken(
             access_token=access_token,
