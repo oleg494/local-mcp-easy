@@ -11,7 +11,7 @@ from core import normalized_program_name, resolve_program, safe_path, should_ski
 class SafePathTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()

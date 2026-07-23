@@ -88,7 +88,7 @@ class TunnelBackendConfigTests(unittest.TestCase):
 class SishTunnelCommandTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.key = Path(self._tmp.name) / "sish_key"
+        self.key = Path(self._tmp.name).resolve() / "sish_key"
         self.key.write_text("KEY", encoding="utf-8")
 
     def tearDown(self):
@@ -170,7 +170,7 @@ class HostAllowlistTests(unittest.TestCase):
 class TunnelSetupWizardTests(unittest.TestCase):
     def test_sish_wizard_writes_config(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             config_file = root / "config.json"
             config_file.write_text(
                 json.dumps({"token": "t", "port": 8765}), encoding="utf-8"
