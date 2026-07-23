@@ -83,8 +83,9 @@ testing) is enforced server-side.
 
 `public_url` is a key in `config.json` (under
 `%LOCALAPPDATA%\LocalMcpEasy`). The supported way to set it is the OAuth setup
-wizard — run **`OAUTH_SETUP.bat`** on Windows (or, on POSIX, the OAuth setup
-wrapper **`./oauth_setup.sh`**). In the wizard:
+wizard — run **`OAUTH_SETUP.bat`** on the **Windows host** (where `config.json`
+lives under `%LOCALAPPDATA%\LocalMcpEasy`), not on the proxy VPS — there is no
+POSIX setup wrapper in this release. In the wizard:
 
 1. Pick `oauth` or `dual` as the auth mode (a custom URL is only relevant for
    these; `legacy` does not use `public_url`).
@@ -171,10 +172,11 @@ Key points:
 
 - **`proxy_set_header Host $host;`** — pass through the *public* Host
   (`mcp.example.com`). The server's Host allowlist compares the Host header to
-  `localhost`, `*.serveousercontent.com`, and (when `public_url` is set) the
-  configured public host. If nginx rewrites Host to `127.0.0.1`, that is still
-  allowed (loopback is on the allowlist), but the cleanest setup is to pass
-  the public Host so the OAuth `iss`/`aud` path and the Host check agree.
+  `localhost`, `*.serveousercontent.com`, and (in `oauth`/`dual` mode, when
+  `public_url` is set) the configured public host. If nginx rewrites Host to
+  `127.0.0.1`, that is still allowed (loopback is on the allowlist), but the
+  cleanest setup is to pass the public Host so the OAuth `iss`/`aud` path and
+  the Host check agree.
 - `proxy_buffering off` + `proxy_http_version 1.1` + Upgrade/Connection
   headers keep Streamable HTTP SSE streams from stalling.
 - `proxy_read_timeout 600s` — Serveo imposes a ~20–30s practical ceiling on
@@ -210,9 +212,9 @@ mcp.example.com {
 
 Caddy terminates TLS automatically and renews the certificate for
 `mcp.example.com`. The **invariant** still applies: set `public_url` to
-exactly `https://mcp.example.com` via `OAUTH_SETUP.bat` / `./oauth_setup.sh`.
-Caddy passes Host as the public host by default; do not rewrite it to
-`127.0.0.1`.
+exactly `https://mcp.example.com` via **`OAUTH_SETUP.bat`** (run on the Windows
+host where `config.json` lives, not on the proxy VPS). Caddy passes Host as the
+public host by default; do not rewrite it to `127.0.0.1`.
 
 ## Traefik
 
@@ -277,7 +279,7 @@ services:
       - "traefik.http.routers.mcp.tls.certresolver=letsencrypt"
       - "traefik.http.routers.mcp.service=mcp"
       - "traefik.http.services.mcp.loadbalancer.server.port=8765"
-      - "traefik.http.services.mcp.loadbalizer.passhostheader=true"
+      - "traefik.http.services.mcp.loadbalancer.passhostheader=true"
       # /mcp is the client-facing path; Host() routing covers the whole host.
 ```
 
@@ -298,7 +300,11 @@ mode and `HostCheckMiddleware` in `oauth`/`dual` mode; a mismatch returns
 
 - `127.0.0.1` and `localhost` (loopback),
 - `*.serveousercontent.com` (reserved Serveo hostnames), and
-- **the host of `public_url`** (when `public_url` is set).
+- **the host of `public_url`** (in `oauth`/`dual` mode, when `public_url` is
+  set).
+
+In legacy mode the public host is **not** added to the allowlist; pass
+`Host: 127.0.0.1` or use `oauth`/`dual` for a public-host proxy.
 
 The FastMCP SDK's own localhost-only DNS-rebinding Host check is **disabled**
 (`transport_security=enable_dns_rebinding_protection=False`) precisely because
