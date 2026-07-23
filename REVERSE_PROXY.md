@@ -84,8 +84,8 @@ testing) is enforced server-side.
 `public_url` is a key in `config.json` (under
 `%LOCALAPPDATA%\LocalMcpEasy`). The supported way to set it is the OAuth setup
 wizard — run **`OAUTH_SETUP.bat`** on the **Windows host** (where `config.json`
-lives under `%LOCALAPPDATA%\LocalMcpEasy`), not on the proxy VPS — there is no
-POSIX setup wrapper in this release. In the wizard:
+lives under `%LOCALAPPDATA%\LocalMcpEasy`), not on the proxy VPS. On Linux/macOS use `./oauth_setup.sh` instead of
+`OAUTH_SETUP.bat`. In the wizard:
 
 1. Pick `oauth` or `dual` as the auth mode (a custom URL is only relevant for
    these; `legacy` does not use `public_url`).

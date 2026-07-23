@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# POSIX wrapper for `launcher.py --tunnel-setup` (mirrors TUNNEL_SETUP.bat).
+# POSIX wrapper for `launcher.py` (mirrors start.bat). Runs in the foreground; Ctrl+C stops it.
 set -e
 cd "$(dirname "$0")"
 
@@ -17,4 +17,4 @@ if ! .venv/bin/python -c "import mcp, uvicorn, starlette" >/dev/null 2>&1; then
     .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
 fi
 
-exec .venv/bin/python launcher.py --tunnel-setup "$@"
+exec .venv/bin/python launcher.py "$@"
