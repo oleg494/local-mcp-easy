@@ -37,7 +37,7 @@ class AllowedCommandsSingleSourceTests(unittest.TestCase):
                 mock.patch("launcher.input", side_effect=[str(workspace)]),
                 mock.patch("launcher.yes_no", side_effect=[False, False]),
             ):
-                config = launcher.setup(force=True)
+                launcher.setup(force=True)
             stored = json.loads(config_file.read_text(encoding="utf-8"))
             self.assertEqual(
                 stored["allowed_commands"],
