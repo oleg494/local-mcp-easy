@@ -56,7 +56,8 @@ that predates `auth_mode` stays `legacy`).
 
 OAuth needs a stable public URL: a reserved Serveo hostname
 ([SERVEO_SETUP.md](SERVEO_SETUP.md)) or your own domain via a custom
-`public_url` (your reverse proxy, no Serveo involved). Pure `oauth` refuses to
+`public_url` (your reverse proxy, no Serveo involved; see
+[REVERSE_PROXY.md](REVERSE_PROXY.md) for nginx/Caddy/Traefik configs). Pure `oauth` refuses to
 start without one; `dual` starts with a warning (the Bearer half works; the
 OAuth half stabilises once the URL is stable). On a free Serveo tunnel the
 one-time "you are about to visit…" interstitial can strip the `/authorize`
@@ -122,6 +123,7 @@ pre-2.0 `NotionMcpEasy` directory are migrated automatically on first run).
 - [README.md](README.md) — primary documentation (Russian)
 - [SECURITY.md](SECURITY.md) — security model
 - [SERVEO_SETUP.md](SERVEO_SETUP.md) — stable tunnel setup
+- [REVERSE_PROXY.md](REVERSE_PROXY.md) — own-domain reverse proxy (nginx/Caddy/Traefik)
 - [CHANGELOG.md](CHANGELOG.md) — release history
 
 ## Verification

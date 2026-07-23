@@ -76,6 +76,12 @@ The setup wizard can enable commands such as Python, Git and Node. This mode is 
 
 Serveo is a third-party SSH tunnel. The public URL and Bearer token must be treated as secrets. Anonymous Serveo URLs are temporary. A reserved hostname authenticated with a dedicated SSH key keeps the URL stable; the private SSH key must never be shared or included in an archive.
 
+## Reverse proxy
+
+An operator may run their own reverse proxy (nginx, Caddy, Traefik) instead of Serveo, routing a stable `https://<public-host>/` to `http://127.0.0.1:8765`. The operator owns TLS termination; the local port is never exposed beyond loopback. The public base URL is stored as `public_url` in `config.json` (set via `OAUTH_SETUP.bat` / `./oauth_setup.sh`) and passed to the server as `MCP_PUBLIC_URL`, which derives the OAuth issuer, discovery metadata, redirect URIs and token audience. `public_url` must **exactly** equal the proxy's external base URL — a mismatch breaks OAuth issuer/discovery/redirect/audience. The launcher skips Serveo automatically when `public_url` is set (`config_uses_serveo`).
+
+The server validates the `Host` header on every request (loopback, `*.serveousercontent.com`, and the host of `public_url` when set); a mismatch returns HTTP 403 `forbidden host`. The SDK's own localhost-only Host check (HTTP 421) is disabled and replaced by this allowlist. A proxy that forwards the public Host header should pass once `public_url` is set, but this Host-check-vs-forwarded-header path is not tested against every proxy — if a 421/403 surfaces, the fallback is a reserved Serveo hostname (`SETUP.bat`) or reporting it for a code fix. See [REVERSE_PROXY.md](REVERSE_PROXY.md) for full config snippets.
+
 ## Secret handling
 
 Configuration is stored in `%LOCALAPPDATA%\LocalMcpEasy`, not in the project folder or release archive. Large temporary MCP outputs are stored in `temp/` next to `server.py`, not inside the selected workspace. Release ZIP files are built into `release/` inside the project, and that folder is intentionally excluded from both Git sync and the release archive itself. The local git binding file `agent-repo-config.local.json` stays in the project root and is intentionally excluded from release archives and normal Git sync. This file records whether git is configured, rebound, or explicitly disabled for the folder, plus the chosen commit-branch policy, so MCP can safely recover after a restart. Never post `connection.txt`, `config.json`, the tunnel URL, the token, or `@temp/...` output files in a public chat.
