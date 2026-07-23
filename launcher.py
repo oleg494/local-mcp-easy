@@ -1062,6 +1062,10 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
         f"Tunnel: {tunnel_mode}\n",
         encoding="utf-8",
     )
+    # connection.txt stores the Bearer token in cleartext; make it owner-only
+    # on POSIX (mirrors the 0700 config dir). No-op on Windows (ACL-based).
+    with contextlib.suppress(OSError):
+        os.chmod(CONNECTION_FILE, 0o600)
     print("\n=======================================================")
     print(f" Local MCP Easy {VERSION} is running")
     print("=======================================================")
