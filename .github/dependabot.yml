@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep Python dependencies (pinned in requirements.txt) up to date.
+  # Bumps are proposed as pull requests for review; pins stay exact.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # Keep GitHub Actions used in CI current (checkout, setup-python, etc.).
+  # Also surfaces new ruff/pip-audit versions indirectly via action bumps.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5

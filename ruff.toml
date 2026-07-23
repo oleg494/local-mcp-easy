@@ -1,4 +1,10 @@
 # Lint policy for Local MCP Easy.
+#
+# Ruff is pinned to an EXACT version in CI for reproducible lint results:
+#   pip install ruff==0.15.22   (see .github/workflows/ci.yml)
+# Keep this comment in sync with the pin in ci.yml when bumping ruff.
+# (ruff.toml has no native "version" field; the pin lives in CI and is
+# documented here for readers.)
 
 [lint.per-file-ignores]
 # Tests must extend sys.path (and sometimes set env vars) before importing
