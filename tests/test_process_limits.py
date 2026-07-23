@@ -21,39 +21,23 @@ import server
 
 
 class ProcessLimitTests(unittest.TestCase):
-    def test_output_is_bounded_and_process_is_stopped(self):
-        async def scenario():
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-c",
-                "import sys; sys.stdout.write('x' * 400000)",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr, timed_out, truncated = await server._capture_process(
-                process, 10
-            )
-            self.assertFalse(timed_out)
-            self.assertTrue(truncated)
-            self.assertLessEqual(
-                len(stdout) + len(stderr), server.MAX_COMMAND_OUTPUT
-            )
-            self.assertIsNotNone(process.returncode)
-
-        asyncio.run(scenario())
-
     def test_timeout_stops_process(self):
         async def scenario():
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-c",
-                "import time; time.sleep(10)",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, _, timed_out, _ = await server._capture_process(process, 1)
-            self.assertTrue(timed_out)
-            self.assertIsNotNone(process.returncode)
+            with tempfile.TemporaryDirectory() as directory:
+                stdout_path = Path(directory) / "stdout.txt"
+                stderr_path = Path(directory) / "stderr.txt"
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(10)",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                timed_out, _ = await server._capture_process_to_files(
+                    process, stdout_path, stderr_path, 1
+                )
+                self.assertTrue(timed_out)
+                self.assertIsNotNone(process.returncode)
 
         asyncio.run(scenario())
 

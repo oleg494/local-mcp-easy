@@ -50,7 +50,12 @@ class ServerSmokeTests(unittest.TestCase):
                 "MCP_BASE_DIR": str(PROJECT),
                 "MCP_PORT": str(port),
                 "MCP_ALLOW_COMMANDS": "0",
-                # Do not inherit a stable hostname from an active MCP session.
+                # Do not inherit auth mode / owner code / stable hostname /
+                # public URL from an active MCP session; this smoke test targets
+                # legacy Bearer auth and must be hermetic.
+                "MCP_AUTH_MODE": "legacy",
+                "MCP_OAUTH_OWNER_CODE": "",
+                "MCP_PUBLIC_URL": "",
                 "MCP_SERVEO_HOSTNAME": "",
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
