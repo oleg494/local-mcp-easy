@@ -12,3 +12,4 @@ agent-repo-config.local.json
 .venv-linux/
 connections.cfg
 oauth_state.json
+HANDOFF.md
