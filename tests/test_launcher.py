@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import signal
 import socket
 import sys
 import tempfile
@@ -563,6 +564,104 @@ class ConfigRobustnessTests(unittest.TestCase):
                 launcher.migrate_legacy_config_dir()
             self.assertTrue((new_dir / "config.json").is_file())
             self.assertIn("old", (new_dir / "config.json").read_text(encoding="utf-8"))
+
+
+class LauncherHardeningTests(unittest.TestCase):
+    """2.2.1 launcher hardening (items G/H/I/J): secure connection file,
+    macOS process identity, stop escalation and tunnel reconnect backoff."""
+
+    # H: macOS/BSD have no /proc, so process_command_line must fall back to ps.
+    @mock.patch("launcher.subprocess.run")
+    @mock.patch("launcher.os.name", "posix")
+    @mock.patch("launcher.pid_exists", return_value=True)
+    def test_process_command_line_falls_back_to_ps_without_proc(self, _exists, run):
+        run.return_value = mock.Mock(returncode=0, stdout="python server.py --flag\n")
+        # A PID with no /proc entry (always true on macOS; also for this fake
+        # PID on Linux) must force the ps fallback path.
+        result = launcher.process_command_line(99_998_877)
+        self.assertEqual(result, "python server.py --flag")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "ps")
+        self.assertIn("-p", argv)
+        self.assertIn("99998877", argv)
+        self.assertIn("command=", argv)
+
+    # I: POSIX stop must escalate SIGTERM -> SIGKILL and report the real result.
+    @mock.patch("launcher.time.sleep")
+    @mock.patch("launcher.os.kill")
+    @mock.patch("launcher.os.name", "posix")
+    def test_stop_pid_escalates_to_sigkill_when_process_survives(self, kill, _sleep):
+        with (
+            mock.patch("launcher.pid_exists", return_value=True),
+            mock.patch("launcher.pid_matches", return_value=True),
+        ):
+            result = launcher.stop_pid(4321, "server.py", timeout=0)
+        self.assertFalse(result)  # process never died -> honest False
+        sent = [call.args[1] for call in kill.call_args_list]
+        self.assertIn(signal.SIGTERM, sent)
+        self.assertIn(getattr(signal, "SIGKILL", signal.SIGTERM), sent)
+
+    @mock.patch("launcher.time.sleep")
+    @mock.patch("launcher.os.kill")
+    @mock.patch("launcher.os.name", "posix")
+    def test_stop_pid_returns_true_after_graceful_sigterm(self, kill, _sleep):
+        # alive for the initial guard and first poll, gone on the second poll.
+        alive = mock.Mock(side_effect=[True, True, False])
+        with (
+            mock.patch("launcher.pid_exists", alive),
+            mock.patch("launcher.pid_matches", return_value=True),
+        ):
+            result = launcher.stop_pid(4321, "server.py", timeout=5)
+        self.assertTrue(result)
+        sent = [call.args[1] for call in kill.call_args_list]
+        self.assertEqual(sent, [signal.SIGTERM])  # no SIGKILL escalation needed
+
+    def test_stop_pid_refuses_on_identity_mismatch(self):
+        with (
+            mock.patch("launcher.pid_exists", return_value=True),
+            mock.patch("launcher.pid_matches", return_value=False),
+            mock.patch("launcher.os.kill") as kill,
+        ):
+            result = launcher.stop_pid(4321, "server.py")
+        self.assertFalse(result)
+        kill.assert_not_called()
+
+    # G: connection.txt holds the Bearer token; it and the config dir must be
+    # created owner-only on POSIX.
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not enforced on Windows")
+    def test_publish_connection_secures_dir_and_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / "cfg"
+            connection_file = config_dir / "connection.txt"
+            runtime_file = config_dir / "runtime.json"
+            config = {
+                "token": "secret-bearer-value",
+                "workspace": directory,
+                "allow_commands": False,
+                "auth_mode": "legacy",
+            }
+            with (
+                mock.patch.object(launcher, "CONFIG_DIR", config_dir),
+                mock.patch.object(launcher, "CONNECTION_FILE", connection_file),
+                mock.patch.object(launcher, "RUNTIME_FILE", runtime_file),
+                mock.patch("builtins.print"),
+            ):
+                launcher.publish_connection(
+                    config, "https://x.serveousercontent.com", 111, 222
+                )
+                self.assertTrue(connection_file.is_file())
+                self.assertEqual(connection_file.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
+
+    # J: tunnel reconnection uses exponential backoff capped at 5 minutes.
+    def test_tunnel_backoff_is_exponential_and_capped(self):
+        self.assertEqual(launcher.tunnel_backoff_delay(1), 3)
+        self.assertEqual(launcher.tunnel_backoff_delay(2), 6)
+        self.assertEqual(launcher.tunnel_backoff_delay(3), 12)
+        self.assertEqual(launcher.tunnel_backoff_delay(4), 24)
+        self.assertEqual(launcher.tunnel_backoff_delay(30), 300)
+        self.assertLessEqual(launcher.tunnel_backoff_delay(100), 300)
+        self.assertEqual(launcher.tunnel_backoff_delay(0), 0)
 
 
 if __name__ == "__main__":
