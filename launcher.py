@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import queue
 import re
@@ -18,8 +19,8 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import TextIO
 
 APP_NAME = "LocalMcpEasy"
 # Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
@@ -748,7 +749,31 @@ def wait_for_server(
     raise RuntimeError(f"MCP server health check failed on port {port}; see {SERVER_LOG}")
 
 
-def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
+def make_log_writer(
+    path: Path, max_bytes: int = 5_000_000, backups: int = 3
+) -> logging.Logger:
+    """Return a size-rotating writer for a raw log file.
+
+    The launcher owns these files exclusively, so rotation is safe here (unlike
+    inside the server, whose stdout is piped into this writer). A named logger is
+    reused per path; existing handlers are closed before being replaced so a
+    tunnel reconnect cannot leak file descriptors.
+    """
+    writer = logging.getLogger(f"lme.rawlog.{path.name}")
+    writer.setLevel(logging.INFO)
+    writer.propagate = False
+    for handler in list(writer.handlers):
+        handler.close()
+    writer.handlers.clear()
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    writer.addHandler(handler)
+    return writer
+
+
+def start_server(config: dict) -> subprocess.Popen:
     port = int(config.get("port", 8765))
     if port_is_open(port):
         raise RuntimeError(
@@ -780,24 +805,33 @@ def start_server(config: dict) -> tuple[subprocess.Popen, TextIO]:
         }
     )
     ensure_config_dir()
-    log = SERVER_LOG.open("w", encoding="utf-8")
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
         [sys.executable, str(SCRIPT_DIR / "server.py")],
         cwd=str(SCRIPT_DIR),
         env=env,
-        stdout=log,
+        stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=flags,
     )
+
+    def pump() -> None:
+        writer = make_log_writer(SERVER_LOG)
+        assert process.stdout is not None
+        for line in process.stdout:
+            writer.info(line.rstrip("\n"))
+
+    threading.Thread(target=pump, daemon=True).start()
     try:
         wait_for_server(port, config["token"], process)
     except Exception:
-        log.close()
         with contextlib.suppress(Exception):
             stop_pid(process.pid, "server.py")
         raise
-    return process, log
+    return process
 
 
 def build_tunnel_command(config: dict) -> list[str]:
@@ -851,12 +885,11 @@ def start_tunnel(config: dict) -> tuple[subprocess.Popen, queue.Queue[str]]:
     lines: queue.Queue[str] = queue.Queue()
 
     def pump() -> None:
-        with TUNNEL_LOG.open("w", encoding="utf-8") as log:
-            assert process.stdout is not None
-            for line in process.stdout:
-                log.write(line)
-                log.flush()
-                lines.put(line)
+        writer = make_log_writer(TUNNEL_LOG)
+        assert process.stdout is not None
+        for line in process.stdout:
+            writer.info(line.rstrip("\n"))
+            lines.put(line)
 
     threading.Thread(target=pump, daemon=True).start()
     return process, lines
@@ -1007,10 +1040,9 @@ def run() -> int:
     RUNTIME_FILE.unlink(missing_ok=True)
 
     server: subprocess.Popen | None = None
-    server_log: TextIO | None = None
     tunnel: subprocess.Popen | None = None
     try:
-        server, server_log = start_server(config)
+        server = start_server(config)
 
         if not config_uses_serveo(config):
             # Custom stable domain: the operator runs their own reverse proxy or
@@ -1076,8 +1108,6 @@ def run() -> int:
             stop_pid(tunnel.pid, "serveo.net")
         if server is not None and server.poll() is None:
             stop_pid(server.pid, "server.py")
-        if server_log is not None:
-            server_log.close()
         RUNTIME_FILE.unlink(missing_ok=True)
 
 
