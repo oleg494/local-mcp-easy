@@ -29,7 +29,7 @@ _ENV = {
     "MCP_TOKEN": "super-secret-token",
     "MCP_PORT": "8767",
     "MCP_ALLOW_COMMANDS": "1",
-    "MCP_ALLOWED_COMMANDS": "git,python3",
+    "MCP_ALLOWED_COMMANDS": "git,python",
     "MCP_SERVEO_HOSTNAME": "",
     "MCP_AUTH_MODE": "legacy",
     "MCP_OAUTH_OWNER_CODE": "owner-code-secret",
@@ -78,7 +78,7 @@ class SpawnedProcessEnvTests(unittest.TestCase):
                 "print('HASPATH=' + repr(bool(os.environ.get('PATH'))))"
             )
             result = asyncio.run(
-                server.run_command(program="python3", args=["-c", code])
+                server.run_command(program="python", args=["-c", code])
             )
             self.assertIn("exit code: 0", result)
             self.assertIn("TOKEN=None", result)
