@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -73,6 +74,12 @@ ALLOWED_COMMANDS = {
 EXCLUDES = set(DEFAULT_EXCLUDES)
 MAX_TEXT_FILE = 5 * 1024 * 1024
 MAX_WRITE = 2 * 1024 * 1024
+# Cap for copy_file/move_file. A client holding mcp:files:write must not be
+# able to exhaust disk by duplicating a multi-GB artifact. Enforced AFTER the
+# _ensure_writable trust-anchor guard, never instead of it. Env-overridable.
+MAX_COPY_MOVE_BYTES = int(
+    os.environ.get("MCP_MAX_COPY_MOVE_BYTES", "") or 100 * 1024 * 1024
+)
 MAX_COMMAND_OUTPUT = 200_000
 MAX_RESULTS = 1000
 MAX_OUTPUT_CHARS = 10_000
@@ -80,7 +87,12 @@ DEFAULT_READ_LINES = 400
 CHUNK_CHAR_LIMIT = 9_500
 TEMP_DIRNAME = "temp"
 TEMP_PATH_PREFIX = "@temp/"
-TEMP_FILE_TTL_SECONDS = 24 * 60 * 60
+# Temp-file TTL for the sweepers below. Env-overridable via MCP_TEMP_FILE_TTL.
+TEMP_FILE_TTL_SECONDS = int(os.environ.get("MCP_TEMP_FILE_TTL", "") or 24 * 60 * 60)
+# Minimum interval between orphan .mcp-tmp sweeps, so the BASE_DIR walk
+# doesn't run on every tool call. Picked to be well below TEMP_FILE_TTL_SECONDS
+# yet large enough to coalesce bursts of tool invocations.
+ORPHAN_SWEEP_MIN_INTERVAL_SECONDS = 60.0
 REPO_CONTEXT_FILE = "agent-repo-config.local.json"
 REPO_CONTEXT_SCHEMA_VERSION = 3
 
@@ -277,6 +289,51 @@ def _cleanup_temp_files() -> None:
             continue
 
 
+# Monotonic-clock timestamp (seconds) of the last orphan .mcp-tmp sweep.
+# Initialized to 0.0 so the first call always performs a sweep.
+_last_orphan_sweep: float = 0.0
+
+
+def _cleanup_orphan_mcp_tmp() -> None:
+    """Sweep BASE_DIR for orphaned ``.{name}.XXXXXX.mcp-tmp`` temp files.
+
+    `_atomic_write_text` creates these next to the target file and renames
+    them into place with `os.replace`. A crash/SIGKILL between `mkstemp` and
+    `os.replace` leaves them behind as orphans that the original
+    `_cleanup_temp_files` (which only sweeps ``temp/*.txt``) never sees.
+
+    Walks BASE_DIR (respecting EXCLUDES and `core.should_skip`), unlinking any
+    ``*.mcp-tmp`` older than TEMP_FILE_TTL_SECONDS. OSError on unlink/stat is
+    suppressed so a concurrent writer or permission hiccup can't break callers.
+
+    Throttled by `ORPHAN_SWEEP_MIN_INTERVAL_SECONDS` via a monotonic-clock
+    last-sweep timestamp so the walk doesn't fire on every tool call.
+    """
+    global _last_orphan_sweep
+    now_mono = time.monotonic()
+    if now_mono - _last_orphan_sweep < ORPHAN_SWEEP_MIN_INTERVAL_SECONDS:
+        return
+    _last_orphan_sweep = now_mono
+    cutoff = dt.datetime.now().timestamp() - TEMP_FILE_TTL_SECONDS
+    base_dir = BASE_DIR
+    include_hidden = False
+    for root, dirs, files in os.walk(base_dir, topdown=True):
+        # Prune excluded directories in-place so os.walk doesn't descend.
+        dirs[:] = [
+            d for d in dirs
+            if not should_skip(base_dir / root / d, include_hidden, EXCLUDES)
+        ]
+        for name in files:
+            if not name.endswith(".mcp-tmp"):
+                continue
+            candidate = Path(root) / name
+            try:
+                if candidate.stat().st_mtime < cutoff:
+                    candidate.unlink()
+            except OSError:
+                continue
+
+
 def _temp_virtual_path(path: Path) -> str:
     return f"{TEMP_PATH_PREFIX}{path.name}"
 
@@ -300,6 +357,7 @@ def _resolve_read_file_path(path: str) -> tuple[Path, bool]:
 
 def _tool_output_path(prefix: str) -> Path:
     _cleanup_temp_files()
+    _cleanup_orphan_mcp_tmp()
     safe_prefix = "".join(
         ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in prefix
     ).strip("-") or "output"
@@ -1932,56 +1990,6 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(proc.wait(), timeout=5)
 
 
-async def _capture_process(
-    proc: asyncio.subprocess.Process, timeout: int
-) -> tuple[bytes, bytes, bool, bool]:
-    """Capture bounded output. Returns stdout, stderr, timed_out, truncated."""
-    stdout_buffer = bytearray()
-    stderr_buffer = bytearray()
-    total = 0
-    limit_reached = asyncio.Event()
-
-    async def consume(stream: asyncio.StreamReader, target: bytearray) -> None:
-        nonlocal total
-        while True:
-            chunk = await stream.read(8192)
-            if not chunk:
-                return
-            remaining = MAX_COMMAND_OUTPUT - total
-            if remaining <= 0:
-                limit_reached.set()
-                continue
-            accepted = chunk[:remaining]
-            target.extend(accepted)
-            total += len(accepted)
-            if len(accepted) < len(chunk):
-                limit_reached.set()
-
-    async def finish() -> None:
-        assert proc.stdout is not None and proc.stderr is not None
-        await asyncio.gather(
-            consume(proc.stdout, stdout_buffer),
-            consume(proc.stderr, stderr_buffer),
-            proc.wait(),
-        )
-
-    run_task = asyncio.create_task(finish())
-    limit_task = asyncio.create_task(limit_reached.wait())
-    done, _ = await asyncio.wait(
-        {run_task, limit_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-    )
-    timed_out = not done
-    truncated = limit_task in done and limit_reached.is_set()
-    if timed_out or truncated:
-        await _kill_tree(proc)
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(run_task, timeout=5)
-    limit_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await limit_task
-    return bytes(stdout_buffer), bytes(stderr_buffer), timed_out, truncated
-
-
 @tool(scope=SCOPE_FILES_READ)
 async def workspace_info() -> str:
     """Show the allowed workspace, active mode, and git repo-context status."""
@@ -2321,6 +2329,23 @@ async def delete_file(path: str) -> str:
     return f"Deleted: {item.relative_to(BASE_DIR)}"
 
 
+def _ensure_copy_move_size(source: Path) -> None:
+    """Reject a copy/move whose source exceeds MAX_COPY_MOVE_BYTES.
+
+    A client holding mcp:files:write could otherwise exhaust disk by
+    duplicating a multi-GB artifact. Runs AFTER the _ensure_writable
+    trust-anchor guard, never instead of it. Override the cap with the
+    MCP_MAX_COPY_MOVE_BYTES environment variable.
+    """
+    size = source.stat().st_size
+    if size > MAX_COPY_MOVE_BYTES:
+        raise ValueError(
+            f"Source exceeds the copy/move size limit: {size} bytes > "
+            f"{MAX_COPY_MOVE_BYTES} bytes "
+            "(raise MCP_MAX_COPY_MOVE_BYTES to allow larger files)."
+        )
+
+
 @tool(scope=SCOPE_FILES_WRITE)
 async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Copy one file inside the workspace."""
@@ -2328,6 +2353,7 @@ async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     _ensure_writable(target)
     if not source.is_file():
         raise ValueError(f"Source is not a file: {src}")
+    _ensure_copy_move_size(source)
     if target.exists() and not overwrite:
         raise ValueError(f"Destination exists: {dst}")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2344,6 +2370,7 @@ async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     _ensure_writable(target)
     if not source.is_file():
         raise ValueError(f"Source is not a file: {src}")
+    _ensure_copy_move_size(source)
     if target.exists() and not overwrite:
         raise ValueError(f"Destination exists: {dst}")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -3133,6 +3160,7 @@ if __name__ == "__main__":
     import uvicorn
 
     _cleanup_temp_files()
+    _cleanup_orphan_mcp_tmp()
     app = mcp.streamable_http_app()
     _install_shutdown_hook(app)
     if AUTH_MODE == AUTH_MODE_LEGACY:

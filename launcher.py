@@ -22,6 +22,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from core import DEFAULT_ALLOWED_COMMANDS
+
 APP_NAME = "LocalMcpEasy"
 # Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
 LEGACY_APP_NAME = "NotionMcpEasy"
@@ -495,19 +497,7 @@ def setup(force: bool = False) -> dict:
         "oauth_owner_code": owner_code,
         "serveo_hostname": serveo_hostname,
         "ssh_key": ssh_key,
-        "allowed_commands": [
-            "git",
-            "make",
-            "node",
-            "npm",
-            "npx",
-            "pip",
-            "py",
-            "pytest",
-            "python",
-            "ruff",
-            "uv",
-        ],
+        "allowed_commands": sorted(DEFAULT_ALLOWED_COMMANDS),
     }
     save_json(CONFIG_FILE, config)
     saved_slot, added_to_connections = remember_workspace_path(workspace, preferred_slot=1)
