@@ -75,25 +75,37 @@ class ProcessLimitTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "process groups are a POSIX concept")
     def test_kill_tree_reaps_grandchildren_of_a_session_leader(self):
-        """The behaviour the group-kill exists for, on a correctly spawned child."""
+        """The behaviour the group-kill exists for, on a correctly spawned child.
+
+        Checks the grandchild PID directly rather than the process group:
+        a group stays alive while any member is still an unreaped zombie, so
+        killpg(group, 0) is racy right after the kill, whereas an orphaned
+        grandchild is reparented to init and reaped promptly.
+        """
         async def scenario():
             # Same spawn options _spawn_process uses.
             parent = await asyncio.create_subprocess_exec(
                 sys.executable, "-c",
                 "import subprocess, sys, time; "
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-                "time.sleep(30)",
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                "print(p.pid, flush=True); time.sleep(30)",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
             self.assertEqual(os.getpgid(parent.pid), parent.pid)
-            await asyncio.sleep(1.0)  # let the grandchild start
-            group = os.getpgid(parent.pid)
+            grandchild = int((await parent.stdout.readline()).decode().strip())
+            os.kill(grandchild, 0)  # precondition: it is really running
+
             await server._kill_tree(parent)
             self.assertIsNotNone(parent.returncode)
-            # The whole group is gone, grandchild included.
-            with self.assertRaises(ProcessLookupError):
-                os.killpg(group, 0)
+
+            for _ in range(50):
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    return
+                await asyncio.sleep(0.1)
+            self.fail(f"grandchild {grandchild} outlived the group kill")
 
         asyncio.run(scenario())
 
