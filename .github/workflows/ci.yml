@@ -61,6 +61,21 @@ jobs:
           git config --global user.name "CI"
           git config --global init.defaultBranch main
 
+      - name: Line endings match .gitattributes
+        # A fresh checkout must be clean. Two .bat files used to show as
+        # modified straight after clone -- purely because their committed blobs
+        # predated the current .gitattributes -- which trains everyone to
+        # ignore "modified" noise in git status. `git add --renormalize .`
+        # fixes it; this step makes the drift fail loudly instead.
+        shell: bash
+        run: |
+          git add --renormalize .
+          if ! git diff --cached --quiet; then
+            echo "::error::Line endings disagree with .gitattributes. Run: git add --renormalize . && git commit"
+            git diff --cached --stat
+            exit 1
+          fi
+
       - name: Lint (ruff)
         run: ruff check .
 

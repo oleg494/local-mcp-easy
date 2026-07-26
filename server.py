@@ -2683,7 +2683,11 @@ async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> s
         for item in root.glob(pattern):
             if not item.is_file() or any(part in EXCLUDES for part in item.parts):
                 continue
-            safe_path(BASE_DIR, item)
+            # Skip anything that resolves outside the workspace (a junction or
+            # symlink caught by the pattern) rather than failing the whole
+            # call: one stray link should not make the tool unusable.
+            if not is_inside(BASE_DIR, item):
+                continue
             rows.append(str(item.relative_to(root)))
             if len(rows) >= limit:
                 break
@@ -2697,12 +2701,14 @@ async def grep_files(
     pattern: str,
     path: str = ".",
     file_glob: str = "*",
-    regex: bool = False,
     max_results: int = 100,
 ) -> str:
-    """Search text files with bounded output. Regex mode is disabled for safety."""
-    if regex:
-        raise ValueError("Regex mode is disabled to prevent pathological expressions")
+    """Search text files for a literal substring, case-insensitively.
+
+    Substring only: a client-supplied regex is a denial-of-service primitive
+    (catastrophic backtracking) against a server that has no request budget.
+    Narrow the search with file_glob and path instead.
+    """
     root = _path(path)
     limit = max(1, min(max_results, 500))
 

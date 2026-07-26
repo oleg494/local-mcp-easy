@@ -1,10 +1,16 @@
 # Lint policy for Local MCP Easy.
 #
-# Ruff is pinned to an EXACT version in CI for reproducible lint results:
-#   pip install ruff==0.15.22   (see .github/workflows/ci.yml)
-# Keep this comment in sync with the pin in ci.yml when bumping ruff.
-# (ruff.toml has no native "version" field; the pin lives in CI and is
-# documented here for readers.)
+# Ruff is pinned to an EXACT version so lint results are reproducible for
+# everyone, not just in CI. Enforced by ruff itself: a mismatched binary fails
+# with "Required version ==0.15.22 does not match the running version", instead
+# of silently linting with a different rule set. (Rules become
+# enabled-by-default between releases -- 0.16.0 reports 47 findings on this
+# same tree, none of them real bugs.)
+#
+# To bump: change this value AND the `pip install ruff==...` line in
+# .github/workflows/ci.yml AND the one in CONTRIBUTING.md, then fix the fallout
+# in one dedicated commit.
+required-version = "0.15.22"
 
 [lint.per-file-ignores]
 # Tests must extend sys.path (and sometimes set env vars) before importing

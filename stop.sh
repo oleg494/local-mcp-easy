@@ -9,12 +9,12 @@ else
     PYTHON_BIN=python
 fi
 
-if [ ! -x ".venv/bin/python" ]; then
-    "$PYTHON_BIN" -m venv .venv
+# No dependency check here, deliberately: launcher.py --stop only reads
+# runtime.json and signals PIDs -- it never imports mcp/uvicorn/starlette. The
+# old check ran `pip install` first, so with `set -e` a down network (a very
+# likely reason to be stopping things) aborted the script before anything was
+# stopped. STOP.bat never had this failure mode; now neither does this.
+if [ -x ".venv/bin/python" ]; then
+    exec .venv/bin/python launcher.py --stop "$@"
 fi
-
-if ! .venv/bin/python -c "import mcp, uvicorn, starlette" >/dev/null 2>&1; then
-    .venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
-fi
-
-exec .venv/bin/python launcher.py --stop "$@"
+exec "$PYTHON_BIN" launcher.py --stop "$@"

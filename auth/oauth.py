@@ -23,11 +23,11 @@ Security properties:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import secrets
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +44,8 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+from core import atomic_write_text
 
 from .base import ALL_SCOPES, DEFAULT_SCOPES, normalize_resource, resources_match
 from .legacy import LegacyTokenVerifier
@@ -167,21 +169,15 @@ class OAuthStore:
             "refresh_tokens": self.refresh_tokens,
         }
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(
-            prefix=".oauth_state_", suffix=".tmp", dir=str(self.state_file.parent)
+        # Shared with the server and the launcher (core.atomic_write_text). The
+        # local copy this replaced never fsync'd, so a power loss could leave
+        # the token store truncated while the other two copies were safe.
+        atomic_write_text(
+            self.state_file, json.dumps(payload, ensure_ascii=False, indent=2)
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-            os.replace(temp_name, self.state_file)
-        except BaseException:
-            _unlink_quietly(temp_name)
-            raise
-        try:
-            os.chmod(self.state_file, 0o600)
-        except OSError:
+        with contextlib.suppress(OSError):
             # Windows ACLs already restrict %LOCALAPPDATA% to the current user.
-            pass
+            os.chmod(self.state_file, 0o600)
 
     def store_client(self, client_id: str, record: dict[str, Any]) -> None:
         """Persist a client record with any raw client_secret replaced by its
@@ -209,13 +205,6 @@ class OAuthStore:
             for key, value in self.refresh_tokens.items()
             if not value.get("expires_at") or value["expires_at"] > now
         }
-
-
-def _unlink_quietly(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 def _reject_redirect(raw: str, reason: str) -> None:
@@ -419,19 +408,6 @@ class LocalOAuthProvider:
                 : len(self._used_codes) - MAX_USED_CODES
             ]:
                 self._used_codes.pop(code, None)
-
-    def _prune_rotated_refresh(self) -> None:
-        cutoff = _now() - ROTATED_REFRESH_TTL
-        self._rotated_refresh = {
-            token_hash: entry
-            for token_hash, entry in self._rotated_refresh.items()
-            if entry[1] > cutoff
-        }
-        if len(self._rotated_refresh) > MAX_ROTATED_REFRESH:
-            for token_hash in sorted(
-                self._rotated_refresh, key=lambda h: self._rotated_refresh[h][1]
-            )[: len(self._rotated_refresh) - MAX_ROTATED_REFRESH]:
-                self._rotated_refresh.pop(token_hash, None)
 
     def get_txn(self, txn_id: str) -> PendingAuthorization | None:
         self._prune_txns()

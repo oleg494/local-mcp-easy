@@ -17,7 +17,7 @@ in Russian ([README.md](README.md)); a short English overview lives in
    python -m venv .venv
    .venv\Scripts\activate        # Windows
    pip install -r requirements.txt
-   pip install ruff
+   pip install ruff==0.15.22   # exact pin; ruff.toml enforces it
    ```
 3. On Windows you can also just double-click `START.bat` for an end-to-end run.
 

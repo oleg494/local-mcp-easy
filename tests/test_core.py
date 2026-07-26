@@ -1,3 +1,6 @@
+import contextlib
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,6 +46,32 @@ class SafePathTests(unittest.TestCase):
             self.skipTest("symlink creation requires privileges on this system")
         with self.assertRaises(ValueError):
             safe_path(self.base, "link/secret.txt")
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-only")
+    def test_junction_escape_is_rejected(self):
+        # The test above skips on any Windows box without Developer Mode or
+        # elevation -- including CI's windows-latest leg -- so the only
+        # regression test for link-based escape may never actually run there.
+        # A junction needs no privilege at all, so this one always runs, and it
+        # covers the sharper case: Path.is_symlink() returns False for a
+        # junction, so nothing that relies on link detection would catch it.
+        outside = self.base.parent / "outside-junction-target"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+        link = self.base / "junction"
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+            capture_output=True, text=True, check=False,
+        )
+        if created.returncode != 0:
+            self.skipTest(f"mklink /J unavailable: {created.stderr.strip()}")
+        try:
+            self.assertFalse(link.is_symlink(), "premise: a junction is not a symlink")
+            with self.assertRaises(ValueError):
+                safe_path(self.base, "junction/secret.txt")
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(link)
 
 
 class ProgramNameTests(unittest.TestCase):
