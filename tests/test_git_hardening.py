@@ -143,6 +143,103 @@ class GitHardeningTests(unittest.TestCase):
         # A refspec that only updates the configured target branch is fine.
         self._check(["fetch", "origin", "main:refs/heads/main"])
 
+    # -- Fix 6 (2.4.0): options that escape a "read-only" subcommand ------
+    # Each of these was verified against a real git binary before the fix:
+    # the option ran a program or touched a path outside the workspace even
+    # though its subcommand is classified read-only / branch-bound.
+    def test_grep_open_files_in_pager_refused(self):
+        # `git grep -O'<cmd>'` runs <cmd> once per matching file -> full
+        # arbitrary execution, bypassing MCP_ALLOWED_COMMANDS entirely.
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["grep", "-Oecho pwned", "needle"])
+        self.assertIn("arbitrary program", str(ctx.exception))
+
+    def test_grep_open_files_in_pager_long_form_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["grep", "--open-files-in-pager=echo pwned", "needle"])
+
+    def test_grep_without_pager_option_allowed(self):
+        self._check(["grep", "-n", "needle"])
+
+    def test_rebase_exec_refused(self):
+        # `git rebase --exec` runs a command after every replayed commit and
+        # rebase is branch-bound-allowed, so this was arbitrary execution.
+        with self.assertRaises(ValueError):
+            self._check(["rebase", "--exec", "echo pwned", "HEAD~1"])
+
+    def test_rebase_exec_short_flag_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["rebase", "-x", "echo pwned", "HEAD~1"])
+
+    def test_diff_no_index_refused(self):
+        # `git diff --no-index <abs> /dev/null` reads any file on the host.
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["diff", "--no-index", "/etc/passwd", "/dev/null"])
+        self.assertIn("outside the approved workspace", str(ctx.exception))
+
+    def test_diff_output_refused(self):
+        # `git diff --output=<abs>` writes any file on the host.
+        with self.assertRaises(ValueError):
+            self._check(["diff", "--output=/tmp/escaped.txt"])
+
+    def test_log_output_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["log", "--output", "/tmp/escaped.txt"])
+
+    def test_fetch_upload_pack_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["fetch", "--upload-pack=echo pwned", "origin"])
+
+    def test_push_receive_pack_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["push", "--receive-pack=echo pwned", "origin", "main"])
+
+    def test_tail_git_dir_refused(self):
+        # Rejected as a global prefix option; must also be rejected after the
+        # subcommand, where the prefix scan no longer looks.
+        with self.assertRaises(ValueError):
+            self._check(["status", "--git-dir=/elsewhere/.git"])
+
+    def test_commit_file_outside_workspace_refused(self):
+        # `git commit -F /etc/passwd` embeds the file in a commit message the
+        # client can read straight back with `git log`.
+        with self.assertRaises(ValueError):
+            self._check(["commit", "-F", "/etc/passwd"])
+
+    def test_commit_file_inside_workspace_allowed(self):
+        (self.workspace / "msg.txt").write_text("subject\n", encoding="utf-8")
+        self._check(["commit", "-F", "msg.txt"])
+
+    def test_clean_x_still_allowed(self):
+        # -x is banned for rebase only; for `git clean` it means "also remove
+        # ignored files" and must keep working.
+        self._check(["clean", "-fdx"])
+
+    def test_ls_files_o_still_allowed(self):
+        # Lower-case -o on ls-files is --others; only grep's -O is banned.
+        self._check(["ls-files", "-o"])
+
+    def test_pathspec_after_double_dash_not_scanned_as_option(self):
+        # Everything after `--` is a pathspec; a file literally named
+        # "--output" must not be mistaken for the banned option.
+        self._check(["log", "--", "--output"])
+
+    # -- Fix 7 (2.4.0): symbolic-ref is not read-only ---------------------
+    def test_symbolic_ref_read_allowed(self):
+        self._check(["symbolic-ref", "HEAD"])
+        self._check(["symbolic-ref", "--short", "HEAD"])
+
+    def test_symbolic_ref_write_refused(self):
+        # Repoints HEAD at another branch, moving the workspace off the
+        # branch the policy pins it to.
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["symbolic-ref", "HEAD", "refs/heads/evil"])
+        self.assertIn("blocked", str(ctx.exception).lower())
+
+    def test_symbolic_ref_delete_refused(self):
+        with self.assertRaises(ValueError):
+            self._check(["symbolic-ref", "-d", "refs/heads/main"])
+
 
 if __name__ == "__main__":
     unittest.main()

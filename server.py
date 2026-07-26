@@ -13,8 +13,8 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,13 +25,16 @@ from core import (
     DEFAULT_ALLOWED_COMMANDS,
     DEFAULT_EXCLUDES,
     _consteq,
+    atomic_write_text,
+    ensure_safe_batch_args,
+    is_inside,
     normalized_program_name,
     resolve_program,
     safe_path,
     should_skip,
 )
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.routes import TOKEN_PATH
+from mcp.server.auth.routes import REVOCATION_PATH, TOKEN_PATH
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -254,7 +257,12 @@ def _ensure_writable(path: Path) -> None:
     Both are trust anchors the git policy depends on, so every mutating file
     tool routes its target(s) through here.
     """
-    if path.name == REPO_CONTEXT_FILE:
+    # Case-insensitively: Windows and macOS filesystems are case-insensitive but
+    # case-preserving, so writing "Agent-Repo-Config.Local.Json" creates a file
+    # that every later lookup for the canonical lowercase name resolves to. A
+    # case-sensitive check here let a files:write-only client forge the trust
+    # anchor and hijack the approved git remote without any git scope at all.
+    if path.name.casefold() == REPO_CONTEXT_FILE.casefold():
         raise ValueError(
             f"Refusing to modify the repo-context trust anchor '{REPO_CONTEXT_FILE}'. "
             "Use setup_git_context(...) / configure_repo_context(...) instead."
@@ -264,7 +272,7 @@ def _ensure_writable(path: Path) -> None:
         parts = path.relative_to(BASE_DIR).parts
     except ValueError:
         parts = path.parts
-    if ".git" in parts:
+    if any(part.casefold() == ".git" for part in parts):
         raise ValueError("Refusing to modify anything inside a .git directory.")
 
 
@@ -322,12 +330,15 @@ def _cleanup_orphan_mcp_tmp() -> None:
         # Prune excluded directories in-place so os.walk doesn't descend.
         dirs[:] = [
             d for d in dirs
-            if not should_skip(base_dir / root / d, include_hidden, EXCLUDES)
+            if not should_skip(Path(root) / d, include_hidden, EXCLUDES)
+            and is_inside(base_dir, Path(root) / d)
         ]
         for name in files:
             if not name.endswith(".mcp-tmp"):
                 continue
             candidate = Path(root) / name
+            if not is_inside(base_dir, candidate):
+                continue
             try:
                 if candidate.stat().st_mtime < cutoff:
                     candidate.unlink()
@@ -1311,6 +1322,28 @@ def _reject_unsafe_git_global_options(prefix: list[str]) -> None:
             )
 
 
+def _expand_short_clusters(args: list[str]) -> list[str]:
+    """Split git's clustered short options so flag matching can't be evaded.
+
+    git's parse-options accepts `-uf` as `-u -f`, so any policy that tests
+    `"-f" in args` (or `arg in blocked`) silently misses a force push written
+    as `git push -uf origin main` -- verified against a real git binary, which
+    accepts `-uf` and rejects a genuinely unknown cluster like `-zf`.
+
+    Yields the original token plus one `-x` per clustered letter, so callers
+    keep matching long options exactly while short options match per letter.
+    """
+    expanded: list[str] = []
+    for arg in args:
+        expanded.append(arg)
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+            # A value may be glued on (`-oname=value`); expanding every letter
+            # is deliberately over-eager, because the failure mode we want here
+            # is a refused push, never an unnoticed force push.
+            expanded.extend(f"-{letter}" for letter in arg[1:])
+    return expanded
+
+
 def _command_positionals(args: list[str], options_with_value: set[str] | None = None) -> list[str]:
     options_with_value = options_with_value or set()
     positionals: list[str] = []
@@ -1394,7 +1427,7 @@ def _is_git_config_read_only(args: list[str]) -> bool:
         "--add", "--replace-all", "--unset", "--unset-all",
         "--remove-section", "--rename-section", "--edit", "-e",
     }
-    if any(flag in args for flag in mutating_flags):
+    if any(flag in _expand_short_clusters(args) for flag in mutating_flags):
         return False
     positionals = _command_positionals(args, {"-f", "--file", "--type", "--default", "--blob", "--fixed-value", "--url"})
     return len(positionals) <= 1
@@ -1421,7 +1454,7 @@ def _is_git_branch_read_only(args: list[str]) -> bool:
     if not args:
         return True
     mutating_flags = {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy", "--delete", "--set-upstream-to", "--unset-upstream", "--edit-description"}
-    if any(flag in args for flag in mutating_flags):
+    if any(flag in _expand_short_clusters(args) for flag in mutating_flags):
         return False
     positionals = _command_positionals(args, {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--column"})
     return len(positionals) == 0
@@ -1430,7 +1463,7 @@ def _is_git_branch_read_only(args: list[str]) -> bool:
 def _is_git_tag_read_only(args: list[str]) -> bool:
     if not args:
         return True
-    if any(flag in args for flag in {"-d", "--delete", "-f", "--force", "-a", "-s", "-u", "-m", "-F", "--cleanup", "--trailer"}):
+    if any(flag in _expand_short_clusters(args) for flag in {"-d", "--delete", "-f", "--force", "-a", "-s", "-u", "-m", "-F", "--cleanup", "--trailer"}):
         return False
     positionals = _command_positionals(args, {"-m", "-F", "-u", "--cleanup", "--trailer"})
     return len(positionals) == 0 or any(flag in args for flag in {"-l", "--list"})
@@ -1516,11 +1549,14 @@ def _blocked_push_mode(args: list[str]) -> str:
     # Force flags (-f/--force/--force-with-lease) can overwrite remote history;
     # the multi-ref modes update/delete refs outside the branch policy. Match on
     # the option base so `--force-with-lease=<ref>` is caught too.
+    # --follow-tags additionally pushes annotated tags reachable from the
+    # pushed commits: refs the argv-level refspec analysis never sees, and
+    # `git tag <name> <any-commit>` can create them while on the target branch.
     blocked = {
-        "--all", "--mirror", "--tags", "--delete", "-d", "--prune",
+        "--all", "--mirror", "--tags", "--follow-tags", "--delete", "-d", "--prune",
         "-f", "--force", "--force-with-lease",
     }
-    for arg in args:
+    for arg in _expand_short_clusters(args):
         base = arg.split("=", 1)[0]
         if base in blocked:
             return base
@@ -1602,6 +1638,84 @@ def _ensure_transport_refspec_allowed(
         )
 
 
+# Options that a SUBCOMMAND accepts which either run an arbitrary program or
+# touch a path the workspace sandbox never validated. These are checked on every
+# git command before any subcommand policy runs, because the read-only
+# classification below is a statement about the *subcommand*, not about every
+# option that subcommand happens to accept. Each entry was verified against a
+# real git binary; the comment names the escape it closes.
+_GIT_BANNED_TAIL_OPTIONS = {
+    # --- run an arbitrary program (full allow-list bypass) -------------------
+    # `git grep -O'sh -c ...' pat` runs the "pager" once per matching file.
+    "--open-files-in-pager",
+    # `git rebase --exec '<cmd>'` runs <cmd> after every replayed commit;
+    # rebase is branch-bound-allowed, so this was arbitrary execution.
+    "--exec",
+    # `git fetch --upload-pack=<cmd>` / `git push --receive-pack=<cmd>` execute
+    # <cmd> locally for local-path and ssh transports.
+    "--upload-pack",
+    "--receive-pack",
+    # Config-driven external programs. `git config` writes are already blocked,
+    # but a pre-existing hostile config must not be reachable on request either.
+    "--ext-diff",
+    "--textconv",
+    # --- read or write a path outside the validated workspace ---------------
+    # `git diff --output=/etc/cron.d/x` writes anywhere on the filesystem.
+    "--output",
+    # `git diff --no-index ~/.ssh/id_rsa /dev/null` reads anywhere.
+    "--no-index",
+    # Belt-and-braces: also rejected as a global prefix option, but a client can
+    # place them after the subcommand where the prefix scan no longer looks.
+    "--git-dir",
+    "--work-tree",
+}
+
+# Short options are per-subcommand: the same letter means something harmless
+# elsewhere (`git clean -x` includes ignored files, `git ls-files -o` lists
+# untracked ones), so a blanket ban would break legitimate use.
+_GIT_BANNED_TAIL_SHORT_OPTIONS = {
+    "grep": {"-O"},      # alias of --open-files-in-pager
+    "rebase": {"-x"},    # alias of --exec
+}
+
+# Options whose value git opens as a file. `git commit -F /etc/passwd` puts the
+# contents in a commit message the client can then read back with `git log`.
+_GIT_PATH_VALUE_OPTIONS = {"-F", "--file", "--template", "--pathspec-from-file"}
+
+
+def _reject_unsafe_git_tail_options(cwd: Path, subcommand: str, tail: list[str]) -> None:
+    """Reject subcommand options that execute a program or escape the workspace."""
+    banned_short = _GIT_BANNED_TAIL_SHORT_OPTIONS.get(subcommand, frozenset())
+    index = 0
+    while index < len(tail):
+        arg = tail[index]
+        index += 1
+        if arg == "--":
+            # Everything after `--` is a pathspec, never an option.
+            break
+        base, _, inline_value = arg.partition("=")
+        if base in _GIT_BANNED_TAIL_OPTIONS:
+            raise ValueError(
+                f"Git is blocked because the option '{base}' can run an arbitrary "
+                "program or reach a path outside the approved workspace."
+            )
+        # Short options glue their value on (`-Ocmd`), so match the prefix.
+        for short in banned_short:
+            if arg == short or arg.startswith(short):
+                raise ValueError(
+                    f"Git is blocked because the option '{short}' can run an "
+                    "arbitrary program."
+                )
+        if base in _GIT_PATH_VALUE_OPTIONS:
+            value = inline_value
+            if not value and index < len(tail):
+                value = tail[index]
+                index += 1
+            if value:
+                # Resolve against git's cwd, which is where git itself would.
+                safe_path(BASE_DIR, cwd / value if not Path(value).is_absolute() else value)
+
+
 def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None) -> None:
     git_args = list(git_args or [])
     state, config, detected, lines = _repo_context_state(cwd, git_args)
@@ -1616,6 +1730,10 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
     _reject_unsafe_git_global_options(git_prefix)
     if not subcommand:
         raise ValueError("Git is blocked because the command could not be classified safely.")
+    # Option-level guard, before the subcommand policy: a subcommand classified
+    # read-only can still accept an option that executes a program or writes
+    # outside the workspace (git grep -O, git diff --output=/...).
+    _reject_unsafe_git_tail_options(cwd, subcommand, tail)
 
     target_branch = _target_commit_branch(config)
     if not target_branch:
@@ -1637,10 +1755,20 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
         "cat-file",
         "blame",
         "grep",
-        "symbolic-ref",
     }
     if subcommand in simple_read_only:
         return
+
+    if subcommand == "symbolic-ref":
+        # `git symbolic-ref HEAD` reads, but `git symbolic-ref HEAD refs/heads/x`
+        # repoints HEAD and `--delete` removes the ref -- both are writes that
+        # move the workspace off the branch the policy is pinned to.
+        if "-d" not in tail and "--delete" not in tail and len(_command_positionals(tail)) <= 1:
+            return
+        raise ValueError(
+            "Git is blocked because writing a symbolic ref moves HEAD off the "
+            f"branch policy for this workspace. Use checkout/switch to {target_branch}."
+        )
 
     if subcommand == "config":
         if _is_git_config_read_only(tail):
@@ -1949,26 +2077,17 @@ def _text_file(path: Path) -> None:
         raise ValueError(f"File is too large ({size:,} bytes; limit {MAX_TEXT_FILE:,})")
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write via unique temp file + replace: crash-safe and safe for parallel calls."""
-    fd, temp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + ".", suffix=".mcp-tmp"
-    )
-    try:
-        # newline="" disables newline translation on write: existing line
-        # endings in `content` are written byte-for-byte. Without it, Windows
-        # text mode rewrites every LF to CRLF, turning an existing CRLF (read
-        # verbatim by edit_file) into CR+CRLF and accumulating a stray CR on
-        # every subsequent edit_file call on the same file.
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temp_name)
-        raise
+def _ensure_not_directory(path: Path, label: str) -> None:
+    """Fail with the API's ValueError instead of a raw OSError from os.replace."""
+    if path.is_dir():
+        raise ValueError(f"{label} is a directory, not a file: {path.name}")
+
+
+# newline="" (core.atomic_write_text's default) disables newline translation on
+# write, so existing line endings survive byte-for-byte. Without it, Windows
+# text mode rewrites every LF to CRLF, turning an existing CRLF (read verbatim
+# by edit_file) into CR+CRLF and accumulating a stray CR on every edit.
+_atomic_write_text = atomic_write_text
 
 
 async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
@@ -1986,7 +2105,14 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
         )
         await killer.wait()
     else:
-        proc.kill()
+        # proc.kill() alone only signals the direct child, so `npm run x` left
+        # its forked grandchildren running after a timeout while the caller was
+        # told "process tree stopped". _spawn_process starts every child in its
+        # own session, so signalling the group matches taskkill /T.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(proc.wait(), timeout=5)
 
@@ -2153,14 +2279,20 @@ async def list_dir(
         else:
             for current, dirs, files in os.walk(root):
                 current_path = Path(current)
+                # is_inside() re-resolves every directory before descending: a
+                # Windows junction is invisible to is_symlink()/followlinks, so
+                # os.walk would otherwise happily walk out of the workspace.
                 dirs[:] = sorted(
                     d
                     for d in dirs
                     if not should_skip(current_path / d, include_hidden, EXCLUDES)
+                    and is_inside(BASE_DIR, current_path / d)
                 )
                 for name in sorted(files):
                     item = current_path / name
                     if should_skip(item, include_hidden, EXCLUDES):
+                        continue
+                    if not is_inside(BASE_DIR, item):
                         continue
                     rows.append(str(item.relative_to(root)))
                     if len(rows) >= limit:
@@ -2236,6 +2368,7 @@ async def write_file(path: str, content: str, overwrite: bool = True) -> str:
         raise ValueError(f"Content exceeds {MAX_WRITE:,} bytes")
     item = _path(path)
     _ensure_writable(item)
+    _ensure_not_directory(item, "Write target")
     if item.exists() and not overwrite:
         raise ValueError(f"File already exists: {path}")
 
@@ -2255,6 +2388,7 @@ async def append_file(path: str, content: str) -> str:
         raise ValueError(f"Content exceeds {MAX_WRITE:,} bytes")
     item = _path(path)
     _ensure_writable(item)
+    _ensure_not_directory(item, "Append target")
     current_size = item.stat().st_size if item.exists() else 0
     if current_size + encoded_size > MAX_TEXT_FILE:
         raise ValueError(f"Resulting file would exceed {MAX_TEXT_FILE:,} bytes")
@@ -2419,11 +2553,19 @@ async def grep_files(
         rows: list[str] = []
         for current, dirs, files in os.walk(root):
             current_path = Path(current)
-            dirs[:] = [d for d in dirs if d not in EXCLUDES and not d.startswith(".")]
+            # is_inside() keeps the walk from following a Windows junction out
+            # of the workspace; is_symlink()/followlinks=False do not see one.
+            dirs[:] = [
+                d for d in dirs
+                if d not in EXCLUDES and not d.startswith(".")
+                and is_inside(BASE_DIR, current_path / d)
+            ]
             for name in files:
                 if not fnmatch.fnmatch(name, file_glob):
                     continue
                 item = current_path / name
+                if not is_inside(BASE_DIR, item):
+                    continue
                 try:
                     if item.stat().st_size > MAX_TEXT_FILE:
                         continue
@@ -2519,6 +2661,10 @@ async def _prepare_command(
             "Command execution is disabled. Re-run SETUP.bat to enable trusted developer mode."
         )
     executable = resolve_program(BASE_DIR, program, ALLOWED_COMMANDS)
+    # Windows launches .bat/.cmd through cmd.exe, which re-parses the command
+    # line; shell=False does not protect an allow-listed npm.cmd from
+    # `--version&whoami`. Reject cmd metacharacters before spawning.
+    ensure_safe_batch_args(executable, list(args or []))
     workdir = _path(cwd)
     if not workdir.is_dir():
         raise ValueError(f"cwd is not a directory: {cwd}")
@@ -2538,6 +2684,10 @@ async def _spawn_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=flags,
+        # Own process group on POSIX (the CREATE_NEW_PROCESS_GROUP equivalent
+        # already set via creationflags) so _kill_tree can signal the whole
+        # group and not leak grandchildren on timeout/cancel/shutdown.
+        start_new_session=os.name != "nt",
         env=_sanitized_env(),
     )
 
@@ -2604,7 +2754,7 @@ async def run_command(
         result = _format_command_result(
             proc.returncode, stdout_text, stderr_text, timed_out, truncated, seconds
         )
-        return _direct_or_saved_output("run-command", result)
+        return await asyncio.to_thread(_direct_or_saved_output, "run-command", result)
     finally:
         with contextlib.suppress(OSError):
             stdout_capture.unlink()
@@ -2632,9 +2782,24 @@ JOB_RETENTION_SECONDS = 600
 _TERMINAL_JOB_STATES = {"done", "timeout", "cancelled", "error"}
 
 
+def _current_client_id() -> str:
+    """Identify the caller for per-client job ownership.
+
+    In oauth/dual mode several independently-consented OAuth clients can hold
+    mcp:commands:run at once, so a job registry keyed only by job_id let any of
+    them read another's command output or kill its process. In legacy mode
+    there is exactly one master token, hence one owner.
+    """
+    if AUTH_MODE == AUTH_MODE_LEGACY:
+        return "legacy"
+    access = get_access_token()
+    return getattr(access, "client_id", "") or "unknown"
+
+
 @dataclass
 class CommandJob:
     job_id: str
+    client_id: str
     program: str
     args: list[str]
     cwd: str
@@ -2701,6 +2866,22 @@ def _running_job_count() -> int:
     return sum(1 for job in _JOBS.values() if job.status == "running")
 
 
+def _owned_job(job_id: str) -> CommandJob:
+    """Look up a job the caller owns, or raise the same error as 'not found'.
+
+    Deliberately indistinguishable from an unknown id: telling one client that
+    another client's job_id exists is itself a disclosure.
+    """
+    job = _JOBS.get(job_id)
+    if job is None or job.client_id != _current_client_id():
+        raise ValueError(
+            f"No background job {job_id!r} (unknown, expired after "
+            f"{JOB_RETENTION_SECONDS}s, or started by another client). "
+            "Use list_commands to see your tracked jobs."
+        )
+    return job
+
+
 async def _run_job(job: CommandJob) -> None:
     """Background driver: reuses _capture_process_to_files exactly as run_command
     does, then records the terminal state. Capture files are kept for later
@@ -2757,6 +2938,7 @@ async def start_command(
     job_id = secrets.token_urlsafe(9)
     job = CommandJob(
         job_id=job_id,
+        client_id=_current_client_id(),
         program=program,
         args=list(args or []),
         cwd=cwd,
@@ -2780,12 +2962,7 @@ async def start_command(
 async def get_command_status(job_id: str) -> str:
     """Return the status, and the final output once finished, of a background job."""
     _prune_jobs()
-    job = _JOBS.get(job_id)
-    if job is None:
-        raise ValueError(
-            f"No background job {job_id!r} (unknown, or expired after "
-            f"{JOB_RETENTION_SECONDS}s). Use list_commands to see tracked jobs."
-        )
+    job = _owned_job(job_id)
     command = f"{job.program} {' '.join(job.args)}".rstrip()
     if job.status == "running":
         stdout_preview = await asyncio.to_thread(_read_text_with_replace, job.stdout_path)
@@ -2800,7 +2977,7 @@ async def get_command_status(job_id: str) -> str:
             f"--- stderr so far {note} ---\n"
             f"{stderr_preview if stderr_preview else '(empty result)'}"
         )
-        return _direct_or_saved_output("get-command-status", body)
+        return await asyncio.to_thread(_direct_or_saved_output, "get-command-status", body)
     if job.status == "cancelled":
         return f"job {job.job_id}: cancelled after {_job_elapsed(job):.1f}s ({command})."
     if job.status == "error":
@@ -2814,16 +2991,14 @@ async def get_command_status(job_id: str) -> str:
         job.exit_code, stdout_text, stderr_text, job.timed_out, job.truncated, job.seconds
     )
     header = f"job {job.job_id}: {job.status} ({_job_elapsed(job):.1f}s)\n"
-    return _direct_or_saved_output("get-command-status", header + result)
+    return await asyncio.to_thread(_direct_or_saved_output, "get-command-status", header + result)
 
 
 @tool(scope=SCOPE_COMMANDS_RUN)
 async def cancel_command(job_id: str) -> str:
     """Kill a running background job's process tree and mark it cancelled."""
     _prune_jobs()
-    job = _JOBS.get(job_id)
-    if job is None:
-        raise ValueError(f"No background job {job_id!r}.")
+    job = _owned_job(job_id)
     if job.status != "running":
         return f"job {job.job_id}: already {job.status}; nothing to cancel."
     job.status = "cancelled"
@@ -2839,15 +3014,19 @@ async def cancel_command(job_id: str) -> str:
 async def list_commands() -> str:
     """List tracked background command jobs (id, status, elapsed, command)."""
     _prune_jobs()
-    if not _JOBS:
+    # Only the caller's own jobs: another client's job_id, program and full
+    # argument list are all disclosure, and its job_id is enough to cancel it.
+    client_id = _current_client_id()
+    own = [job for job in _JOBS.values() if job.client_id == client_id]
+    if not own:
         return "No background command jobs."
     lines = [f"{'JOB_ID':<14} {'STATUS':<10} {'ELAPSED':>9}  COMMAND"]
-    for job in sorted(_JOBS.values(), key=lambda item: item.created_at):
+    for job in sorted(own, key=lambda item: item.created_at):
         command = f"{job.program} {' '.join(job.args)}".rstrip()
         lines.append(
             f"{job.job_id:<14} {job.status:<10} {_job_elapsed(job):>8.1f}s  {command}"
         )
-    return _direct_or_saved_output("list-commands", "\n".join(lines))
+    return await asyncio.to_thread(_direct_or_saved_output, "list-commands", "\n".join(lines))
 
 
 def _install_shutdown_hook(app) -> None:
@@ -3075,7 +3254,12 @@ class ClientSecretAuthMiddleware(BaseHTTPMiddleware):
     authorization code / refresh token it targeted is left unconsumed)."""
 
     async def dispatch(self, request, call_next):
-        if request.method != "POST" or request.url.path != TOKEN_PATH:
+        # /revoke uses the SAME SDK ClientAuthenticator as /token, and get_client
+        # returns client_secret=None, so the SDK skips its own comparison there
+        # too. Without this path, anyone who merely knows a confidential
+        # client's client_id could revoke its tokens (RFC 7009 requires the AS
+        # to authenticate the client first).
+        if request.method != "POST" or request.url.path not in (TOKEN_PATH, REVOCATION_PATH):
             return await call_next(request)
         assert oauth_provider is not None
         try:

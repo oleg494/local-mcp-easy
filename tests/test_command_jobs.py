@@ -79,7 +79,7 @@ class _JobTestBase(unittest.TestCase):
         return started_message.splitlines()[0].split()[2].rstrip(":")
 
     def _new_job(self, job_id, *, status, finished_at=None, created_at=None,
-                 write_files=True):
+                 write_files=True, client_id=None):
         s = self.server
         stdout = s._tool_output_path(f"jobtest-{job_id}-stdout")
         stderr = s._tool_output_path(f"jobtest-{job_id}-stderr")
@@ -88,6 +88,10 @@ class _JobTestBase(unittest.TestCase):
             stderr.write_text("err", encoding="utf-8")
         job = s.CommandJob(
             job_id=job_id,
+            # Default to the caller identity the tests' legacy auth mode yields,
+            # so a job created here is owned by the same client start_command
+            # would record. Pass client_id= to simulate a different client.
+            client_id=client_id if client_id is not None else s._current_client_id(),
             program="python",
             args=[],
             cwd=".",
