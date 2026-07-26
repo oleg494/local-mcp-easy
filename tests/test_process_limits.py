@@ -41,6 +41,74 @@ class ProcessLimitTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    @unittest.skipIf(os.name == "nt", "process groups are a POSIX concept")
+    def test_kill_tree_never_signals_our_own_process_group(self):
+        """A child that is NOT its own group leader must be killed alone.
+
+        _kill_tree signals the process group so a timed-out `npm run x` cannot
+        leave grandchildren behind. But a process spawned without
+        start_new_session shares the SERVER's group, and signalling that group
+        SIGKILLs the server itself. This happened: the timeout test above
+        builds its own subprocess, and the first version of the group-kill took
+        down the entire test run on every POSIX CI cell while Windows stayed
+        green (taskkill /T targets one PID's tree, so it never had the bug).
+
+        The assertion is simply that this test survives to make it.
+        """
+        import signal
+
+        async def scenario():
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(30)",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            # Precondition: the child shares our group, so a naive killpg here
+            # would target the test runner.
+            self.assertEqual(os.getpgid(process.pid), os.getpgid(0))
+            self.assertNotEqual(os.getpgid(process.pid), process.pid)
+            await server._kill_tree(process)
+            self.assertIsNotNone(process.returncode)
+
+        asyncio.run(scenario())
+        # Reached only if we were not killed along with the child.
+        self.assertTrue(signal.SIGKILL)
+
+    @unittest.skipIf(os.name == "nt", "process groups are a POSIX concept")
+    def test_kill_tree_reaps_grandchildren_of_a_session_leader(self):
+        """The behaviour the group-kill exists for, on a correctly spawned child.
+
+        Checks the grandchild PID directly rather than the process group:
+        a group stays alive while any member is still an unreaped zombie, so
+        killpg(group, 0) is racy right after the kill, whereas an orphaned
+        grandchild is reparented to init and reaped promptly.
+        """
+        async def scenario():
+            # Same spawn options _spawn_process uses.
+            parent = await asyncio.create_subprocess_exec(
+                sys.executable, "-c",
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                "print(p.pid, flush=True); time.sleep(30)",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            self.assertEqual(os.getpgid(parent.pid), parent.pid)
+            grandchild = int((await parent.stdout.readline()).decode().strip())
+            os.kill(grandchild, 0)  # precondition: it is really running
+
+            await server._kill_tree(parent)
+            self.assertIsNotNone(parent.returncode)
+
+            for _ in range(50):
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    return
+                await asyncio.sleep(0.1)
+            self.fail(f"grandchild {grandchild} outlived the group kill")
+
+        asyncio.run(scenario())
+
     def test_capture_process_to_files_is_bounded(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as directory:

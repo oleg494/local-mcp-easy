@@ -86,13 +86,37 @@ class JunctionPremiseTests(_JunctionBase):
             self.skipTest("POSIX uses a real symlink, which is_symlink() does see")
         self.assertFalse(self.link.is_symlink())
 
-    def test_oswalk_descends_through_the_link(self):
+    def test_oswalk_reaches_outside_content_through_the_link(self):
+        """The escape os.walk permits, which differs by platform.
+
+        Windows: a junction is not a symlink, so followlinks=False does not
+        stop os.walk descending into it and it yields the outside directory's
+        files. POSIX: os.walk correctly refuses to descend a symlinked
+        DIRECTORY, but still lists a symlinked FILE, which grep_files would
+        then read through. Both are escapes; is_inside() closes both.
+        """
         found = {
             name
             for _, _, files in os.walk(self.root, followlinks=False)
             for name in files
         }
-        self.assertIn("secret.txt", found)
+        if os.name == "nt":
+            self.assertIn("secret.txt", found)
+            return
+        self.assertNotIn(
+            "secret.txt", found,
+            "POSIX os.walk should not descend a symlinked directory",
+        )
+        # ... but a symlinked file is listed, and reading it escapes.
+        file_link = self.root / "secret_link.txt"
+        file_link.symlink_to(self.outside / "secret.txt")
+        listed = {
+            name
+            for _, _, files in os.walk(self.root, followlinks=False)
+            for name in files
+        }
+        self.assertIn("secret_link.txt", listed)
+        self.assertEqual(file_link.read_text().strip(), SECRET)
 
     def test_safe_path_itself_rejects_the_escape(self):
         with self.assertRaises(ValueError):
@@ -108,6 +132,18 @@ class JunctionEscapeTests(_JunctionBase):
     def test_grep_files_still_finds_content_inside_the_workspace(self):
         out = asyncio.run(server.grep_files("ordinary content", self.rel))
         self.assertIn("inside.txt", out)
+
+    def test_grep_files_does_not_read_through_a_linked_file(self):
+        # The escape that survives on POSIX: os.walk refuses to descend a
+        # symlinked directory but still lists a symlinked FILE, which the
+        # reader would then follow straight out of the workspace.
+        link = self.root / "secret_link.txt"
+        try:
+            link.symlink_to(self.outside / "secret.txt")
+        except OSError:
+            self.skipTest("file symlinks need privileges on this system")
+        out = asyncio.run(server.grep_files(SECRET, self.rel))
+        self.assertNotIn(SECRET, out)
 
     def test_recursive_list_dir_does_not_list_through_the_link(self):
         out = asyncio.run(server.list_dir(self.rel, recursive=True))
