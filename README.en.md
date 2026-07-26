@@ -6,7 +6,7 @@
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
-![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-370%20passing-brightgreen.svg)
 
 Run local filesystem, command and Git tools through MCP using
 Streamable HTTP and OAuth 2.1.
@@ -136,10 +136,15 @@ pre-2.0 `NotionMcpEasy` directory are migrated automatically on first run).
 .venv\Scripts\ruff check .
 ```
 
-The suite (261 tests) covers path traversal, token auth, the full OAuth flow
+The suite (370 tests) covers path traversal, token auth, the full OAuth flow
 (DCR, PKCE, consent, rotation, replay revocation, revocation, restart
 survival), per-tool scope enforcement, dual mode, the git guard-layer and the
-launcher.
+launcher. 2.4.0 adds the cmd.exe metacharacter guard for .bat/.cmd programs
+(with a live Windows proof that cmd really does re-parse the command line),
+Windows junction escapes, the `@temp/` virtual-path resolver, per-client job
+ownership, read-only mode, the audit log, secret redaction, tool annotations,
+`--doctor`, the ssh argv hardening, and a default-deny regression test for
+unclassified git subcommands.
 
 ## Project history
 

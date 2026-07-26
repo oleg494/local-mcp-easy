@@ -40,6 +40,12 @@ CONNECTIONS_FILE = CONFIG_DIR / "connections.cfg"
 LEGACY_CONNECTIONS_FILE = SCRIPT_DIR / "connections.cfg"
 CONNECTIONS_TEMPLATE_FILE = SCRIPT_DIR / "connections.example.cfg"
 SERVER_LOG = CONFIG_DIR / "server.log"
+# Identity marker stop_pid() checks before killing the server PID. The
+# absolute script path, not the bare "server.py": the check is an unanchored
+# substring match, and after PID reuse a bare filename could match some
+# unrelated project's server.py. Runtime files written by <=2.3.x still hold
+# the bare name and keep working (the readers default to it).
+SERVER_PROCESS_MATCH = str(SCRIPT_DIR / "server.py")
 TUNNEL_LOG = CONFIG_DIR / "tunnel.log"
 URL_PATTERN = re.compile(r"https://[a-zA-Z0-9.-]+\.serveousercontent\.com")
 PATH_SLOT_PATTERN = re.compile(r"PATH\[(\d+)\]$", re.IGNORECASE)
@@ -854,7 +860,7 @@ def start_server(config: dict) -> subprocess.Popen:
         wait_for_server(port, config["token"], process)
     except Exception:
         with contextlib.suppress(Exception):
-            stop_pid(process.pid, "server.py")
+            stop_pid(process.pid, SERVER_PROCESS_MATCH)
         raise
     return process
 
@@ -1023,7 +1029,7 @@ def publish_connection(config: dict, url: str, server_pid: int, tunnel_pid: int)
     runtime = {
         "version": VERSION,
         "server_pid": server_pid,
-        "server_match": "server.py",
+        "server_match": SERVER_PROCESS_MATCH,
         "tunnel_pid": tunnel_pid,
         "tunnel_match": tunnel_process_match(config),
         "url": endpoint,
@@ -1192,7 +1198,7 @@ def run() -> int:
         if tunnel is not None and tunnel.poll() is None:
             stop_pid(tunnel.pid, tunnel_process_match(config))
         if server is not None and server.poll() is None:
-            stop_pid(server.pid, "server.py")
+            stop_pid(server.pid, SERVER_PROCESS_MATCH)
         RUNTIME_FILE.unlink(missing_ok=True)
 
 

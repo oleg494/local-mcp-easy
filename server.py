@@ -427,6 +427,7 @@ def _cleanup_temp_files() -> None:
 # Initialized to -inf so the first call always sweeps, even on a freshly booted
 # host where time.monotonic() is still below ORPHAN_SWEEP_MIN_INTERVAL_SECONDS.
 _last_orphan_sweep: float = float("-inf")
+_orphan_sweep_lock = threading.Lock()
 
 
 def _cleanup_orphan_mcp_tmp() -> None:
@@ -445,10 +446,14 @@ def _cleanup_orphan_mcp_tmp() -> None:
     last-sweep timestamp so the walk doesn't fire on every tool call.
     """
     global _last_orphan_sweep
-    now_mono = time.monotonic()
-    if now_mono - _last_orphan_sweep < ORPHAN_SWEEP_MIN_INTERVAL_SECONDS:
-        return
-    _last_orphan_sweep = now_mono
+    # The read-compare-write of the throttle gate runs on worker threads
+    # (asyncio.to_thread), so without a lock a burst of concurrent tool calls
+    # all pass the check and each starts a full BASE_DIR walk.
+    with _orphan_sweep_lock:
+        now_mono = time.monotonic()
+        if now_mono - _last_orphan_sweep < ORPHAN_SWEEP_MIN_INTERVAL_SECONDS:
+            return
+        _last_orphan_sweep = now_mono
     cutoff = dt.datetime.now().timestamp() - TEMP_FILE_TTL_SECONDS
     base_dir = BASE_DIR
     include_hidden = False
@@ -1595,46 +1600,44 @@ def _is_git_tag_read_only(args: list[str]) -> bool:
     return len(positionals) == 0 or any(flag in args for flag in {"-l", "--list"})
 
 
-def _checkout_target_branch(args: list[str]) -> str:
+def _first_branch_argument(args: list[str], naming_options: set[str]) -> str:
+    """The branch a subcommand targets: the value of the first branch-naming
+    option present, else the first positional.
+
+    checkout/switch/branch differ only in which options name a branch
+    (`-b`/`-B` vs `-c`/`-C` vs the delete/move set), so they share one scanner.
+    Everything after `--` is a pathspec and is never scanned.
+    """
     scan = args[: args.index("--")] if "--" in args else args
     index = 0
     while index < len(scan):
         arg = scan[index]
-        if arg in {"-b", "-B", "--orphan"}:
+        if arg in naming_options:
             return scan[index + 1] if index + 1 < len(scan) else ""
+        option, sep, value = arg.partition("=")
+        if sep and option in naming_options:
+            return value
         if arg.startswith("-"):
             index += 1
             continue
         return arg
     return ""
+
+
+def _checkout_target_branch(args: list[str]) -> str:
+    return _first_branch_argument(args, {"-b", "-B", "--orphan"})
 
 
 def _switch_target_branch(args: list[str]) -> str:
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in {"-c", "-C", "--orphan"}:
-            return args[index + 1] if index + 1 < len(args) else ""
-        if arg.startswith("-"):
-            index += 1
-            continue
-        return arg
-    return ""
+    return _first_branch_argument(args, {"-c", "-C", "--orphan"})
 
 
 def _branch_target(args: list[str]) -> str:
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy", "--delete", "--set-upstream-to"}:
-            return args[index + 1] if index + 1 < len(args) else ""
-        if arg.startswith("--set-upstream-to="):
-            return arg.split("=", 1)[1]
-        if arg.startswith("-"):
-            index += 1
-            continue
-        return arg
-    return ""
+    return _first_branch_argument(
+        args,
+        {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy", "--delete",
+         "--set-upstream-to"},
+    )
 
 
 def _push_remote_and_refspecs(args: list[str]) -> tuple[str, list[str]]:
@@ -3215,6 +3218,7 @@ async def _shutdown_running_jobs() -> None:
     process trees do not outlive the server. On Windows a child process is not
     terminated automatically when its parent exits, so without this a long job
     could be orphaned when the server is stopped."""
+    stopped = []
     for job in list(_JOBS.values()):
         if job.status == "running":
             job.status = "cancelled"
@@ -3223,6 +3227,14 @@ async def _shutdown_running_jobs() -> None:
             if job.proc is not None:
                 with contextlib.suppress(Exception):
                     await _kill_tree(job.proc)
+            stopped.append(job)
+    # Let each driver task observe the dead process and run its finally block,
+    # so capture handles are closed before the loop goes away. Bounded, because
+    # shutdown must not hang on a task that refuses to finish.
+    pending = [job.task for job in stopped if job.task is not None and not job.task.done()]
+    if pending:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(pending, timeout=5)
 
 
 def _extract_token(request) -> str:

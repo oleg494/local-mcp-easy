@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
-![Tests](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-370%20passing-brightgreen.svg)
 
 Локальные файловые инструменты, команды и Git через MCP — по Streamable HTTP с OAuth 2.1.
 
@@ -45,6 +45,7 @@ OAuth-клиент ────────── OAuth 2.1 ──────�
 - `SHOW_CONNECTION.bat` — показать текущие URL, workspace и режимы; токен и OAuth owner code маскируются, `--full` показывает их полностью.
 - `OAUTH_SETUP.bat` — выбрать режим авторизации `legacy / oauth / dual` и сгенерировать OAuth owner code.
 - `REGISTER_OAUTH_CLIENT.bat` — заранее зарегистрировать OAuth-клиент для режима «Bring my own OAuth app».
+- `DOCTOR.bat` / `./doctor.sh` (2.4.0) — диагностика сломанной установки одной командой: версия Python, зависимости, config, токен, workspace, режим авторизации, owner code, tunnel backend, наличие ssh и git, занят ли порт. Возвращает ненулевой код, если что-то сломано.
 - `launcher.py --add-command ИМЯ` / `--remove-command ИМЯ` — безопасно изменить список разрешённых команд без ручной правки JSON (ручная правка с BOM/лишней запятой раньше сбрасывала настройку — теперь launcher останавливается с понятной ошибкой и ничего не перезаписывает).
 
 ## connections.cfg
@@ -77,7 +78,33 @@ OAuth-клиент ────────── OAuth 2.1 ──────�
 python, py, pip, git, node, npm, npx, pytest, ruff, make, uv
 ```
 
-Это **не песочница**. Python, Node, Git hooks, npm scripts и другие инструменты могут обращаться ко всей системе и сети с правами текущего пользователя Windows. Включайте режим только для личного доверенного агента. Git через MCP теперь проходит через отдельный setup-flow: без local repo context (`agent-repo-config.local.json`) обычные git-команды блокируются, а агент должен сначала либо привязать существующий репозиторий, либо инициализировать новый, либо явно отключить git для этой папки. Если сервер собирается принять значения по умолчанию или изменить уже сохранённую git-привязку, агент обязан запросить явное подтверждение пользователя.
+Это **не песочница**. Python, Node, Git hooks, npm scripts и другие инструменты могут обращаться ко всей системе и сети с правами текущего пользователя Windows. Включайте режим только для личного доверенного агента.
+
+С 2.4.0 аргументы к `.cmd`/`.bat`-программам (на Windows это `npm` и `npx`) отклоняются, если содержат метасимволы `& | < > ^ " % !`: Windows запускает batch-файлы через `cmd.exe`, который заново разбирает командную строку, поэтому `npm` с аргументом `--version&whoami` выполнял `whoami` в обход allow-list — при `shell=False` и argv списком (BatBadBut, тот же класс, что CVE-2024-24576).
+
+### Read-only mode — опционально (2.4.0)
+
+`MCP_READ_ONLY=1` вообще не регистрирует изменяющие инструменты: их нет в `list_tools()`, и до них не может дойти ни один запрос. Гарантия структурная, а не «проверка scope сработает». Подходит, чтобы дать агенту посмотреть рабочую папку через туннель, ничего не рискуя.
+
+### Аудит вызовов (2.4.0)
+
+`MCP_AUDIT_LOG=<путь>` пишет по одной JSON-строке на каждый вызов инструмента — время, OAuth `client_id`, имя инструмента, именованные аргументы (обрезанные) и результат `ok`/`error`. Сервер, доступный из интернета и умеющий запускать команды, обязан оставлять след; больше это нигде не фиксировалось. Секреты в лог не попадают, а сбой записи никогда не ломает сам вызов.
+
+```json
+{"ts":"2026-07-26T14:02:11+00:00","client":"mcp_client_a1b2","tool":"run_command","outcome":"ok","args":{"args":"['test']","cwd":".","program":"pytest"}}
+```
+
+### Переменные окружения (выборочно)
+
+| Переменная | По умолчанию | Назначение |
+| --- | --- | --- |
+| `MCP_READ_ONLY` | `0` | `1` — изменяющие инструменты не регистрируются вовсе |
+| `MCP_AUDIT_LOG` | (пусто) | путь к append-only JSONL-журналу вызовов |
+| `MCP_ALLOW_COMMANDS` | `0` | `1` — включить trusted developer mode |
+| `MCP_ALLOWED_COMMANDS` | см. список выше | allow-list программ через запятую |
+| `MCP_MAX_COMMAND_JOBS` | `4` | сколько фоновых команд может идти параллельно |
+| `MCP_MAX_COPY_MOVE_BYTES` | `100 МБ` | потолок для `copy_file` / `move_file` |
+| `MCP_TEMP_FILE_TTL` | `86400` | сколько живут временные файлы `@temp/` | Git через MCP теперь проходит через отдельный setup-flow: без local repo context (`agent-repo-config.local.json`) обычные git-команды блокируются, а агент должен сначала либо привязать существующий репозиторий, либо инициализировать новый, либо явно отключить git для этой папки. Если сервер собирается принять значения по умолчанию или изменить уже сохранённую git-привязку, агент обязан запросить явное подтверждение пользователя.
 
 ## Архитектура
 
@@ -134,9 +161,9 @@ legacy  — только статический Bearer token (например N
 
 | Scope | Инструменты |
 | --- | --- |
-| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `glob_files`, `grep_files` |
+| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `tail_file`, `glob_files`, `grep_files` |
 | `mcp:files:write` | `write_file`, `append_file`, `edit_file`, `create_dir`, `delete_file`, `copy_file`, `move_file` |
-| `mcp:commands:run` | `run_command` (дополнительно требуется trusted developer mode) |
+| `mcp:commands:run` | `run_command`, `start_command`, `get_command_status`, `cancel_command`, `list_commands` (дополнительно требуется trusted developer mode) |
 | `mcp:git` | `repo_context_status`, `inspect_git_repository`, `configure_repo_context`, `setup_git_context` |
 
 Проверка scope выполняется перед каждым вызовом инструмента (deny-by-default: инструмент без известного scope не регистрируется). Токен только с `mcp:files:read` не может изменять файлы, запускать команды или трогать git.
@@ -174,7 +201,7 @@ legacy  — только статический Bearer token (например N
 - `workspace_info` — workspace, активный режим, root repo и краткий обзор nested repo;
 - `repo_context_status`, `inspect_git_repository` — диагностика git и следующего безопасного шага;
 - `setup_git_context`, `configure_repo_context` — инициализация, привязка, перепривязка или отключение git для конкретной папки с обязательным выбором branch policy;
-- `list_dir`, `file_info`, `read_file`;
+- `list_dir`, `file_info`, `read_file`, `tail_file`;
 - `write_file`, `append_file`, `edit_file`;
 - `create_dir`, безопасное нерекурсивное `delete_file`;
 - `copy_file`, `move_file` — только отдельные файлы;
@@ -183,7 +210,13 @@ legacy  — только статический Bearer token (например N
 
 `read_file()` теперь читает длинные файлы частями: показывает диапазон строк, общее число строк и `next offset` для продолжения. Если `run_command()`, `grep_files()` или `list_dir()` возвращают слишком большой результат, MCP сохраняет полный вывод во временный файл и отдаёт первую безопасную часть с путём вида `@temp/...` для продолжения через `read_file()`.
 
-Regex-поиск отключён, чтобы исключить зависание на патологических выражениях. Обычный регистронезависимый поиск остаётся доступен.
+`tail_file(path, lines)` (2.4.0) отдаёт последние N строк — для логов и длинных транскриптов, где `read_file()` пришлось бы каждый раз пересчитывать offset от начала файла.
+
+Regex-поиск отключён, чтобы исключить зависание на патологических выражениях. Обычный регистронезависимый поиск остаётся доступен: клиентский regex — это готовый DoS-примитив (катастрофический бэктрекинг) против сервера без бюджета на запрос.
+
+### Аннотации инструментов (2.4.0)
+
+Все инструменты объявляют MCP-аннотации `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`, поэтому клиент видит, что можно выполнять без подтверждения, а что требует спросить пользователя. `readOnlyHint` выводится из scope инструмента, а не задаётся вручную, — так он не может разойтись с реальностью.
 
 ## Ограничения
 
@@ -223,7 +256,7 @@ Regex-поиск отключён, чтобы исключить зависан�
 .venv\Scripts\ruff check .
 ```
 
-Набор из 140 тестов покрывает path traversal, allowlist, занятый порт, PID-проверку, правильный и неправильный токены, Serveo Host без HTTP 421, chunked-выдачу, repo bootstrap / disable / mismatch guard и timeout процесса. OAuth-набор дополнительно проверяет discovery, DCR, PKCE (включая неверный verifier), state, consent с owner-кодом и троттлингом (правильный код всегда проходит), scope-ограничения per tool, лимиты клиентского реестра, ротацию refresh-токенов, replay authorization code, отзыв токенов, dual-режим (Bearer + X-API-Key + OAuth параллельно), переживание перезапуска сервера выданными токенами, а также устойчивость config.json и oauth_state.json к повреждению.
+Набор из 370 тестов покрывает path traversal, allowlist, занятый порт, PID-проверку, правильный и неправильный токены, Serveo Host без HTTP 421, chunked-выдачу, repo bootstrap / disable / mismatch guard и timeout процесса. С 2.4.0 добавлены: guard на метасимволы cmd.exe для .cmd/.bat-программ (с живой проверкой на Windows, что cmd действительно переразбирает командную строку), побеги через Windows junction, резолвер виртуальных путей `@temp/`, владение фоновыми задачами по OAuth-клиенту, read-only mode, аудит-лог, редакция секретов, аннотации инструментов, `--doctor`, защита argv для ssh и default-deny для неклассифицированных git-подкоманд. OAuth-набор дополнительно проверяет discovery, DCR, PKCE (включая неверный verifier), state, consent с owner-кодом и троттлингом (правильный код всегда проходит), scope-ограничения per tool, лимиты клиентского реестра, ротацию refresh-токенов, replay authorization code, отзыв токенов, dual-режим (Bearer + X-API-Key + OAuth параллельно), переживание перезапуска сервера выданными токенами, а также устойчивость config.json и oauth_state.json к повреждению.
 
 ## Что улучшено относительно оригинала
 

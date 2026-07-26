@@ -1,5 +1,144 @@
 # Changelog
 
+## 2.4.0 — 2026-07-26 (Security audit, tool annotations, read-only mode, audit log)
+
+A full multi-dimension review of 2.3.2 (auth, filesystem, command execution,
+git gating, launcher, async lifecycle, packaging, tests, MCP conformance,
+simplification), with every finding independently re-checked before it was
+accepted. Each item below was reproduced against a real git / npm / Windows
+before being fixed, and each has a regression test. Tests: 261 → 370.
+
+### Security — arbitrary code execution
+
+- **`git grep -O'<cmd>'` / `--open-files-in-pager` ran an arbitrary program**
+  once per matching file. `grep` was classified read-only, so this bypassed
+  `MCP_ALLOWED_COMMANDS` entirely.
+- **`git rebase --exec` / `-x '<cmd>'`** runs a command after every replayed
+  commit, and `rebase` was branch-bound-allowed.
+- **`git fetch --upload-pack=` / `git push --receive-pack=`** execute the given
+  program locally for local-path and ssh transports.
+- **BatBadBut on Windows (`npm`, `npx`).** Windows cannot launch a `.cmd`/`.bat`
+  without cmd.exe, which re-parses the command line; Python's argv quoting only
+  quotes arguments containing whitespace and never escapes cmd's
+  metacharacters. An allow-listed `npm` handed the single argument
+  `--version&whoami` ran `whoami`, despite `shell=False` and a list argv.
+  Arguments to a batch target are now rejected if they contain
+  ``& | < > ^ " % !`` or a newline.
+
+### Security — sandbox escape
+
+- **`git diff --no-index <path> /dev/null` read any file on the host**, and
+  **`git diff|log|show --output=<path>` wrote any file on the host**;
+  `git commit -F <path>` embedded any file in a commit message. Options that
+  execute a program or name a path are now rejected before the subcommand
+  policy runs, and file-valued options are resolved through the workspace guard.
+- **Windows directory junctions escaped the workspace.** `mklink /J` needs no
+  admin rights and a junction is not a symlink, so `os.walk(followlinks=False)`
+  descended straight through one: `grep_files` returned file contents from
+  outside `BASE_DIR` to a client holding only `mcp:files:read`. `safe_path`
+  itself was always correct; the tree walks never re-validated what `os.walk`
+  handed them. `grep_files`, recursive `list_dir`, `glob_files` and the orphan
+  sweep now re-check every entry.
+
+### Security — policy bypass
+
+- **Clustered short options.** git parses `-uf` as `-u -f`, so the force-push
+  blocklist never fired on `git push -uf origin main`. Short options are now
+  expanded before matching, in the push, branch, tag and config classifiers.
+- **`git push --follow-tags`** pushes tag refs the refspec analysis never sees.
+- **`git symbolic-ref HEAD <ref>`** repoints HEAD; it was in the read-only set.
+- **The repo-context trust anchor was compared case-sensitively.** On Windows
+  and macOS a client holding only `mcp:files:write` could create
+  `Agent-Repo-Config.Local.Json` — a different string, the same file — and forge
+  the approved git remote with no git scope at all.
+- **Background jobs were shared across OAuth clients.** `CommandJob` now records
+  the client that started it; `list_commands`, `get_command_status` and
+  `cancel_command` only see the caller's own jobs, and a foreign job id is
+  indistinguishable from an unknown one.
+- **`/revoke` did not enforce confidential-client secrets.** It shares the SDK's
+  `ClientAuthenticator` with `/token`, where `get_client()` returns
+  `client_secret=None`, so only `/token` was actually protected.
+- **`tunnel_host` reached ssh as an unvalidated destination.** ssh parses its own
+  argv, so `-oProxyCommand=...` would have run that command. Option-shaped hosts
+  and non-numeric ports are refused, and `--` precedes the destination.
+
+### Added
+
+- **MCP tool annotations** on all 22 tools (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`) so a client can tell what is safe to run
+  unattended. `readOnlyHint` is derived from the tool's scope unless it opts out
+  explicitly, so it cannot drift from reality.
+- **`MCP_READ_ONLY=1`** — the mutating tools are never registered, so the
+  guarantee does not depend on a scope check holding. For exposing a workspace
+  over a tunnel for review or inspection.
+- **`MCP_AUDIT_LOG=<path>`** — one append-only JSON line per tool call with the
+  OAuth client id, named arguments (bound from positional ones too) and outcome.
+  Never raises: a log that can break the tool it audits is worse than none.
+- **Secret redaction.** Tool output is scanned for the master token and the
+  OAuth owner code before it leaves the process, so a stray `.env` picked up by
+  `grep_files` cannot hand a client credentials it was never granted.
+- **`tail_file(path, lines)`** — the last N lines of a text file. `read_file`
+  counts from the start, so following a log meant recomputing an offset per poll.
+- **`launcher.py --doctor`** (`DOCTOR.bat` / `doctor.sh`) — checks Python
+  version, dependencies, config, token, workspace, auth mode, owner code, tunnel
+  backend, ssh/git availability and whether the port is already taken.
+
+### Fixed
+
+- `_kill_tree` signals the process group on POSIX instead of only the direct
+  child, so `npm run`'s grandchildren are no longer orphaned on timeout, cancel
+  or shutdown — the result already claimed "process tree stopped".
+- Graceful shutdown waits (bounded) for job driver tasks to finish, not just for
+  the processes to die.
+- `run_command` / `get_command_status` / `list_commands` no longer run a
+  full-workspace `os.walk` on the event loop when output exceeds the chunk limit.
+- `write_file` / `append_file` on a directory raise `ValueError` like the rest of
+  the API, instead of a raw `OSError` from `os.replace`.
+- The orphan-sweep throttle is now taken under a lock; concurrent tool calls on
+  worker threads could all pass the check and each start a full tree walk.
+- `stop.sh` no longer `pip install`s before stopping. `--stop` only reads
+  `runtime.json` and signals PIDs, but under `set -e` a failed install (no
+  network — a likely reason to be stopping) aborted before anything stopped.
+- `REGISTER_OAUTH_CLIENT.bat` installs dependencies like its `.sh` counterpart;
+  `--register-oauth-client` imports `mcp` and crashed with `ModuleNotFoundError`
+  after `SETUP.bat` but before `START.bat`.
+- The server PID identity check anchors on the absolute script path rather than
+  the bare name `server.py`.
+- `glob_files` skips a match resolving outside the workspace instead of failing
+  the whole call.
+
+### Changed
+
+- `grep_files` drops its `regex` parameter, which only ever raised. The
+  docstring now explains why matching is literal (a client-supplied regex is a
+  denial-of-service primitive against a server with no request budget).
+- One `atomic_write_text` in `core.py`, shared by the server, the launcher and
+  the OAuth store. The three copies had drifted — the OAuth one never `fsync`'d,
+  so a power loss could truncate the token store.
+- `checkout` / `switch` / `branch` target extraction is one scanner instead of
+  three near-identical copies, and now also understands the `--opt=value` form.
+- `ruff.toml` sets `required-version = "0.15.22"`, so a mismatched ruff fails
+  loudly instead of silently linting with a different rule set (0.16.0 reports
+  47 findings on this tree). `CONTRIBUTING.md` names the same pin as CI.
+
+### Tests
+
+- 261 → 370. New coverage for the batch-argument guard (including a live
+  Windows proof that cmd.exe really does re-parse), junction escapes, the
+  `@temp/` virtual path resolver (previously untested), job ownership,
+  read-only mode, the audit log, redaction, tool annotations, `--doctor`, the
+  ssh argv hardening, and a default-deny regression test for unclassified git
+  subcommands (`submodule`, `clone`, `filter-branch`, `worktree`, `bisect`, …).
+- `safe_path`'s only link-escape test was skipped on any Windows box without
+  Developer Mode, including CI's Windows leg. A junction-based companion test
+  needs no privileges and always runs.
+
+### CI
+
+- A step that fails when line endings disagree with `.gitattributes`. Two `.bat`
+  files showed as modified straight after clone, which trains contributors to
+  ignore a dirty `git status`.
+
 ## 2.3.2 — 2026-07-23 (CI/test fixes, sish docs)
 
 ### Fixed
