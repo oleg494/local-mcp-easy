@@ -2237,11 +2237,22 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
         # proc.kill() alone only signals the direct child, so `npm run x` left
         # its forked grandchildren running after a timeout while the caller was
         # told "process tree stopped". _spawn_process starts every child in its
-        # own session, so signalling the group matches taskkill /T.
+        # own session, so signalling its group matches taskkill /T.
+        #
+        # Signal the group ONLY when the child really leads its own group. A
+        # process spawned without start_new_session shares OUR group, and
+        # killpg would then SIGKILL the server itself -- verified the hard way:
+        # a test that built its own subprocess took down the whole test run on
+        # every POSIX CI cell. Checking leadership makes that unreachable by
+        # construction rather than by remembering to pass one keyword.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
+            if os.getpgid(proc.pid) == proc.pid:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, ProcessLookupError):
+            with contextlib.suppress(OSError, ProcessLookupError):
+                proc.kill()
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(proc.wait(), timeout=5)
 

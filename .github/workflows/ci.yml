@@ -102,4 +102,9 @@ jobs:
           echo "TEMP=${RUNNER_TEMP}" >> "$GITHUB_ENV"
 
       - name: Run tests
+        # The suite finishes in under a minute; a cap means a hang shows up as
+        # a failed cell in two minutes instead of occupying a runner until the
+        # six-hour default. Earned: a process-group kill bug once wedged all
+        # eight POSIX cells at this exact step with no output at all.
+        timeout-minutes: 10
         run: python -m unittest discover -s tests -v
