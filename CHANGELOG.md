@@ -1,5 +1,96 @@
 # Changelog
 
+## 2.5.0 — 2026-07-26 (Agent skills and persistent memory)
+
+Two things an autonomous agent usually has and an MCP server usually does not: a
+library of reusable procedures, and memory that survives the session. Here every
+connected MCP client gets them, not one particular agent.
+
+Both reach the model through the MCP `instructions` field returned at
+`initialize` — the only channel a server has into a client's system prompt.
+Anything else would have to be pulled with a tool call the client must first
+know to make.
+
+### Added — skills
+
+- A skill is a folder holding `SKILL.md`: YAML frontmatter plus markdown
+  instructions. The format is the portable core of the
+  [agentskills.io](https://agentskills.io/specification) spec (`name`,
+  `description`, `license`, `compatibility`, `metadata`) with none of the
+  client-specific extensions, so the same skill also loads in Claude Code.
+- Two locations: `<config>/skills/<name>/SKILL.md` for personal skills available
+  in every workspace, and `<workspace>/.mcp-skills/<name>/SKILL.md` for skills
+  that belong to one project.
+- **Progressive disclosure, three levels**, so a large library stays affordable:
+  1. always — `name: description`, one line per skill, in the server
+     instructions and via `skills_list()`;
+  2. on demand — the `SKILL.md` body, via `skill_view(name)`;
+  3. separately — `references/`, `scripts/` and `assets/` are never inlined even
+     at level 2; the rendered skill ends with a list of them and a
+     `skill_view(name, file_path=...)` pointer.
+- **A skill is instructions the model will follow, so it is a trust boundary,
+  not data.** A personal skill always wins over a workspace skill of the same
+  name — the workspace is writable by any client holding `mcp:files:write`, so
+  the other precedence would be a privilege escalation — and a workspace skill
+  is labelled `[workspace]` everywhere it is rendered. Descriptions are
+  flattened to one line so they cannot forge extra index entries in the system
+  prompt. Nothing here executes: a skill may *tell* the model to run something,
+  which then goes through `run_command` and its allow-list like any other
+  command.
+- The frontmatter parser is hand-rolled (~60 lines) rather than adding PyYAML to
+  a three-dependency project. It handles scalars, quoted values, `>`/`|` block
+  scalars and a one-level `metadata` map, and ignores anything else rather than
+  guessing at it.
+
+### Added — memory
+
+- Two flat files under `<config>/memory/`: `MEMORY.md` for what the agent
+  learned about the environment and the work, `USER.md` for what it learned
+  about the person. Entries are separated by a lone `§` line. No database, no
+  embeddings — recall here means the whole store is put in front of the model,
+  so there is nothing to rank, and an index would add a dependency, a build step
+  and a failure mode to answer a query that is never asked.
+- Budgets are measured in **characters**, not entries (2200 / 1375, both
+  env-overridable). An entry cap would let one rambling entry crowd out ten
+  useful ones; the character cap manages what is actually scarce. An over-budget
+  write is **refused** and hands back the current contents so the model can
+  consolidate and retry — never silently truncated.
+- The store lives outside the workspace, so no filesystem tool can reach it:
+  memory changes only through `memory_write`, where the scope check applies.
+  Files are written atomically and are owner-only (`0600`) on POSIX.
+- An entry containing the delimiter is refused, since it would silently become
+  two entries — a second, unreviewed memory forged by one write. Mutations take
+  a lock: they are read-modify-write of a whole file from `asyncio.to_thread`
+  worker threads, so concurrent writes would otherwise lose one.
+
+### Added — tools
+
+| Tool | Scope |
+| --- | --- |
+| `skills_list()` | `mcp:files:read` |
+| `skill_view(name, file_path="")` | `mcp:files:read` |
+| `memory_read(target="all")` | `mcp:files:read` |
+| `memory_write(action, content, target, old_text)` | `mcp:files:write` |
+
+No new OAuth scopes, deliberately: tokens already issued keep working. Under
+`MCP_READ_ONLY=1`, `memory_write` is simply not registered.
+
+New environment variables: `MCP_SKILLS_DIR`, `MCP_MEMORY_DIR`, `MCP_MEMORY`,
+`MCP_MEMORY_CHAR_LIMIT`, `MCP_USER_CHAR_LIMIT`.
+
+### Changed
+
+- `launcher.py --doctor` reports how many skills are visible and whether a
+  memory store exists.
+
+### Tests
+
+- 370 → 449. Frontmatter parsing (block scalars, nesting, BOM, malformed input),
+  discovery precedence including the personal-over-workspace rule, all three
+  disclosure levels, support-file traversal, index-forgery via a multi-line
+  description, memory format and budget boundaries, delimiter injection, and an
+  eight-thread concurrent-write race.
+
 ## 2.4.1 — 2026-07-26 (Process-group kill fix)
 
 - **`_kill_tree` signalled the process group unconditionally.** On POSIX it

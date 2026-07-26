@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/oleg494/local-mcp-easy?sort=semver)](https://github.com/oleg494/local-mcp-easy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10--3.13-blue.svg)
-![Tests](https://img.shields.io/badge/tests-370%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-449%20passing-brightgreen.svg)
 
 Локальные файловые инструменты, команды и Git через MCP — по Streamable HTTP с OAuth 2.1.
 
@@ -94,12 +94,100 @@ python, py, pip, git, node, npm, npx, pytest, ruff, make, uv
 {"ts":"2026-07-26T14:02:11+00:00","client":"mcp_client_a1b2","tool":"run_command","outcome":"ok","args":{"args":"['test']","cwd":".","program":"pytest"}}
 ```
 
+## Скилы и память (2.5.0)
+
+Две вещи, которые обычно есть у автономного агента, но не у MCP-сервера: библиотека
+многоразовых процедур и память, переживающая сессию. Здесь их получает **любой**
+подключённый MCP-клиент, а не один конкретный агент.
+
+Обе подсистемы едут в клиент через поле `instructions` MCP-ответа на `initialize` —
+единственный штатный канал сервера в системный промпт модели. Всё остальное клиенту
+пришлось бы вытягивать вызовом инструмента, о котором он должен догадаться.
+
+### Скилы
+
+Скил — папка с `SKILL.md`: YAML-frontmatter плюс markdown-инструкции. Формат — переносимое
+ядро спецификации [agentskills.io](https://agentskills.io/specification) (`name`,
+`description`, `license`, `compatibility`, `metadata`), без расширений, специфичных для
+конкретного клиента, так что тот же скил читается и в Claude Code.
+
+```
+%LOCALAPPDATA%\LocalMcpEasy\skills\<имя>\SKILL.md   ← личные, доступны в любой рабочей папке
+<workspace>\.mcp-skills\<имя>\SKILL.md              ← скилы проекта, только здесь
+```
+
+```markdown
+---
+name: release-notes
+description: >
+  Собирает changelog из git diff, группируя по типу изменения.
+  Использовать, когда просят release notes или саммари PR для пользователей.
+license: MIT
+---
+
+# Release notes
+
+1. `git diff <base>..<head>`
+2. Разложить на Added / Changed / Fixed / Removed.
+3. Один пункт на логическое изменение, языком пользователя.
+
+Полная спецификация — в [references/format.md](references/format.md).
+```
+
+Раскрытие трёхуровневое, чтобы большая библиотека не съедала контекст:
+
+1. **Всегда** — только `имя: описание`, одна строка на скил, в `instructions` и в `skills_list()`.
+2. **По требованию** — тело `SKILL.md`, через `skill_view(name)`.
+3. **Отдельно** — `references/`, `scripts/`, `assets/` не инлайнятся даже на втором уровне:
+   в конце тела появляется их список и подсказка `skill_view(name, file_path=...)`.
+
+**Скил — это инструкции, которым модель следует, то есть граница доверия, а не данные.**
+Отсюда два следствия, оба проверяются тестами: личный скил всегда побеждает одноимённый
+скил из рабочей папки (рабочую папку может писать любой клиент с `mcp:files:write`, так что
+обратный приоритет был бы повышением привилегий), а скил из рабочей папки помечается
+`[workspace]` везде, где отображается. Скил ничего не исполняет: он может *попросить*
+модель что-то запустить, и это пойдёт через `run_command` с его allow-list, как любая
+другая команда.
+
+### Память
+
+Два плоских файла в `%LOCALAPPDATA%\LocalMcpEasy\memory\`: `MEMORY.md` — что агент узнал про
+окружение и работу, `USER.md` — что узнал про человека. Записи разделены строкой `§`. Ни
+базы, ни эмбеддингов: recall здесь означает «весь стор целиком показан модели», так что
+ранжировать нечего — индекс добавил бы зависимость, шаг сборки и точку отказа ради запроса,
+которого никогда не будет.
+
+Ограничение — **в символах**, не в записях (2200 для `MEMORY.md`, 1375 для `USER.md`). Лимит
+на количество позволил бы одной пространной записи вытеснить десять полезных, а символьный
+управляет тем, что реально дефицитно, — местом в контексте. Запись сверх бюджета
+**отклоняется** и возвращает текущее содержимое, чтобы модель сократила и повторила; молча
+обрезать нельзя — так теряются записи.
+
+Стор лежит вне рабочей папки, поэтому до него не дотягивается ни один файловый инструмент:
+изменить память можно только через `memory_write`, а значит каждое изменение проходит
+проверку scope.
+
+| Инструмент | Scope | Что делает |
+| --- | --- | --- |
+| `skills_list()` | `mcp:files:read` | индекс скилов |
+| `skill_view(name, file_path="")` | `mcp:files:read` | тело скила или его вспомогательный файл |
+| `memory_read(target="all")` | `mcp:files:read` | текущая память с указанием бюджета |
+| `memory_write(action, content, target, old_text)` | `mcp:files:write` | `add` / `replace` / `remove` |
+
+Новых OAuth-scope не появилось намеренно: уже выданные токены продолжают работать, а в
+`MCP_READ_ONLY=1` инструмент `memory_write` просто не регистрируется.
+
 ### Переменные окружения (выборочно)
 
 | Переменная | По умолчанию | Назначение |
 | --- | --- | --- |
 | `MCP_READ_ONLY` | `0` | `1` — изменяющие инструменты не регистрируются вовсе |
 | `MCP_AUDIT_LOG` | (пусто) | путь к append-only JSONL-журналу вызовов |
+| `MCP_SKILLS_DIR` | `<config>\skills` | папка личных скилов |
+| `MCP_MEMORY_DIR` | `<config>\memory` | папка стора памяти |
+| `MCP_MEMORY` | `1` | `0` — выключить память целиком |
+| `MCP_MEMORY_CHAR_LIMIT` | `2200` | бюджет `MEMORY.md` в символах |
+| `MCP_USER_CHAR_LIMIT` | `1375` | бюджет `USER.md` в символах |
 | `MCP_ALLOW_COMMANDS` | `0` | `1` — включить trusted developer mode |
 | `MCP_ALLOWED_COMMANDS` | см. список выше | allow-list программ через запятую |
 | `MCP_MAX_COMMAND_JOBS` | `4` | сколько фоновых команд может идти параллельно |
@@ -161,8 +249,8 @@ legacy  — только статический Bearer token (например N
 
 | Scope | Инструменты |
 | --- | --- |
-| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `tail_file`, `glob_files`, `grep_files` |
-| `mcp:files:write` | `write_file`, `append_file`, `edit_file`, `create_dir`, `delete_file`, `copy_file`, `move_file` |
+| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `tail_file`, `glob_files`, `grep_files`, `skills_list`, `skill_view`, `memory_read` |
+| `mcp:files:write` | `write_file`, `append_file`, `edit_file`, `create_dir`, `delete_file`, `copy_file`, `move_file`, `memory_write` |
 | `mcp:commands:run` | `run_command`, `start_command`, `get_command_status`, `cancel_command`, `list_commands` (дополнительно требуется trusted developer mode) |
 | `mcp:git` | `repo_context_status`, `inspect_git_repository`, `configure_repo_context`, `setup_git_context` |
 
@@ -206,6 +294,8 @@ legacy  — только статический Bearer token (например N
 - `create_dir`, безопасное нерекурсивное `delete_file`;
 - `copy_file`, `move_file` — только отдельные файлы;
 - `glob_files`, ограниченный текстовый `grep_files`;
+- `skills_list`, `skill_view` — библиотека многоразовых процедур (см. «Скилы и память»);
+- `memory_read`, `memory_write` — память, переживающая сессию;
 - `run_command` — только в trusted developer mode.
 
 `read_file()` теперь читает длинные файлы частями: показывает диапазон строк, общее число строк и `next offset` для продолжения. Если `run_command()`, `grep_files()` или `list_dir()` возвращают слишком большой результат, MCP сохраняет полный вывод во временный файл и отдаёт первую безопасную часть с путём вида `@temp/...` для продолжения через `read_file()`.

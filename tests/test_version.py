@@ -14,7 +14,7 @@ os.environ["MCP_AUTH_MODE"] = "legacy"
 import launcher
 import server
 
-EXPECTED_VERSION = "2.4.1"
+EXPECTED_VERSION = "2.5.0"
 
 
 class VersionConsistencyTests(unittest.TestCase):

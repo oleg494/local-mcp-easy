@@ -1587,6 +1587,26 @@ def _doctor_checks(config: dict) -> list[tuple[str, str, str]]:
     add(bool(shutil.which("git")) or None, "git",
         shutil.which("git") or "not on PATH -- the git tools will stay blocked")
 
+    # Skills and memory are optional, so a missing directory is normal, not a
+    # fault -- these rows exist to answer "is the server seeing my skill?".
+    skills_dir = Path(str(config.get("skills_dir", "")).strip() or CONFIG_DIR / "skills")
+    try:
+        skill_names = sorted(
+            entry.name for entry in skills_dir.iterdir()
+            if entry.is_dir() and (entry / "SKILL.md").is_file()
+        )
+    except OSError:
+        skill_names = []
+    add(True, "skills",
+        f"{len(skill_names)} in {skills_dir}"
+        + (f" ({', '.join(skill_names[:5])}{'...' if len(skill_names) > 5 else ''})" if skill_names else ""))
+
+    memory_dir = CONFIG_DIR / "memory"
+    stored = [
+        name for name in ("MEMORY.md", "USER.md") if (memory_dir / name).is_file()
+    ]
+    add(True, "memory", ", ".join(stored) if stored else f"empty ({memory_dir})")
+
     port = int(config.get("port", 8765) or 8765)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.settimeout(0.4)
