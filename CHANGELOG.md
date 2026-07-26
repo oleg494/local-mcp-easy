@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.4.1 — 2026-07-26 (Process-group kill fix)
+
+- **`_kill_tree` signalled the process group unconditionally.** On POSIX it
+  ran `os.killpg(os.getpgid(proc.pid), SIGKILL)` on any child. A process that
+  was *not* spawned with `start_new_session` shares the server's own group, so
+  that call SIGKILLs the server. Every production spawn goes through
+  `_spawn_process`, which always sets `start_new_session=True`, so a running
+  server was never at risk — but the footgun was one forgotten keyword away,
+  and it did fire: 2.4.0's own test suite creates a bare subprocess, and all
+  eight POSIX CI cells hung at the test step with no output while all four
+  Windows cells passed (`taskkill /T` targets one PID's tree, so Windows never
+  had the bug). The group is now signalled only when the child really leads
+  its own group; otherwise the child alone is killed.
+- **CI: `timeout-minutes: 10` on the test step.** The hang above occupied
+  runners for 17 minutes before it was noticed and would have run to the
+  six-hour default. A cap turns a hang into a failed cell in two minutes.
+- Two regression tests, both POSIX-only: a child sharing our group must be
+  killed alone (the test surviving to make its assertion *is* the assertion),
+  and a correctly spawned session leader's grandchild must still be reaped.
+  The second checks the grandchild PID directly rather than the group —
+  a group stays alive while any member is an unreaped zombie.
+- `tests/test_sandbox_walk.py` no longer assumes POSIX `os.walk` descends a
+  symlinked directory (it correctly does not; only Windows junctions slip
+  past). Added the escape that *does* survive on POSIX — a symlinked **file**
+  is listed by `os.walk` and was read through — so `is_inside()` is covered on
+  Linux and macOS too, not just Windows.
+
 ## 2.4.0 — 2026-07-26 (Security audit, tool annotations, read-only mode, audit log)
 
 A full multi-dimension review of 2.3.2 (auth, filesystem, command execution,
