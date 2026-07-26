@@ -351,5 +351,65 @@ class LiveExecutionTests(_JobTestBase):
         self.assertIn("No background job", str(ctx.exception))
 
 
+class JobOwnershipTests(_JobTestBase):
+    """A job belongs to the OAuth client that started it.
+
+    In oauth/dual mode several independently-consented clients can hold
+    mcp:commands:run at once. Keying the registry on job_id alone let any of
+    them list another client's full command line, read its stdout (secrets and
+    all), or kill it mid-flight.
+    """
+
+    def test_start_command_records_the_caller(self):
+        s = self.server
+
+        async def _run():
+            started = await s.start_command(program="python", args=["-c", "pass"])
+            job_id = self._parse_job_id(started)
+            # Await the driver inside the same loop: leaving a subprocess
+            # transport pending when asyncio.run() closes the loop wedges the
+            # next test's loop on Windows.
+            await s._JOBS[job_id].task
+            return job_id
+
+        job_id = asyncio.run(_run())
+        self.assertEqual(s._JOBS[job_id].client_id, s._current_client_id())
+
+    def test_another_clients_job_is_invisible_to_list(self):
+        s = self.server
+        self._new_job("mine", status="done")
+        self._new_job("theirs", status="done", client_id="some-other-client")
+        listing = asyncio.run(s.list_commands())
+        self.assertIn("mine", listing)
+        self.assertNotIn("theirs", listing)
+
+    def test_another_clients_job_cannot_be_read(self):
+        s = self.server
+        self._new_job("theirs", status="done", client_id="some-other-client")
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(s.get_command_status(job_id="theirs"))
+        # Indistinguishable from an unknown id: confirming the id exists is
+        # itself a disclosure.
+        self.assertIn("No background job", str(ctx.exception))
+
+    def test_another_clients_job_cannot_be_cancelled(self):
+        s = self.server
+        job = self._new_job("theirs", status="running", client_id="some-other-client")
+        with self.assertRaises(ValueError):
+            asyncio.run(s.cancel_command(job_id="theirs"))
+        self.assertEqual(job.status, "running")
+
+    def test_only_other_clients_jobs_reads_as_empty(self):
+        s = self.server
+        self._new_job("theirs", status="done", client_id="some-other-client")
+        self.assertIn("No background command jobs", asyncio.run(s.list_commands()))
+
+    def test_own_job_is_still_fully_accessible(self):
+        s = self.server
+        self._new_job("mine", status="running")
+        self.assertIn("mine", asyncio.run(s.get_command_status(job_id="mine")))
+        self.assertIn("cancelled", asyncio.run(s.cancel_command(job_id="mine")))
+
+
 if __name__ == "__main__":
     unittest.main()

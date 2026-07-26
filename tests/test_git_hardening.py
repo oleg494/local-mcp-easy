@@ -240,6 +240,58 @@ class GitHardeningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._check(["symbolic-ref", "-d", "refs/heads/main"])
 
+    # -- Fix 8 (2.4.0): clustered short options ---------------------------
+    # git's parse-options accepts `-uf` as `-u -f`; verified against a real
+    # git binary, which takes `-uf` and rejects a bogus cluster like `-zf`.
+    # Exact-token matching therefore missed every clustered form.
+    def test_push_clustered_force_refused(self):
+        for cluster in ("-uf", "-fu", "-qf", "-fnv"):
+            with self.assertRaises(ValueError, msg=cluster):
+                self._check(["push", cluster, "origin", "main"])
+
+    def test_push_clustered_without_force_allowed(self):
+        self._check(["push", "-uq", "origin", "main"])
+
+    def test_branch_clustered_delete_is_not_read_only(self):
+        self.assertFalse(self.server._is_git_branch_read_only(["-rd", "topic"]))
+
+    def test_tag_clustered_force_is_not_read_only(self):
+        self.assertFalse(self.server._is_git_tag_read_only(["-af", "v1"]))
+
+    def test_expand_short_clusters_keeps_long_options_intact(self):
+        expand = self.server._expand_short_clusters
+        self.assertEqual(expand(["--force-with-lease"]), ["--force-with-lease"])
+        self.assertEqual(expand(["-f"]), ["-f"])
+        self.assertEqual(expand(["main"]), ["main"])
+        self.assertEqual(expand(["-uf"]), ["-uf", "-u", "-f"])
+
+    # -- Fix 9 (2.4.0): --follow-tags writes unvalidated tag refs ---------
+    def test_push_follow_tags_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["push", "--follow-tags", "origin", "main"])
+        self.assertIn("blocked", str(ctx.exception).lower())
+
+    # -- Default-deny safety net for unclassified subcommands -------------
+    # These are the reason the classifier ends in a raise rather than a
+    # return. Pin it so an accidental explicit-allow shows up as a test diff.
+    def test_dangerous_subcommands_are_denied_by_default(self):
+        for argv in (
+            ["submodule", "add", "https://evil.example/repo", "x"],
+            ["submodule", "update", "--init"],
+            ["clone", "https://evil.example/repo"],
+            ["filter-branch", "--tree-filter", "touch pwned"],
+            ["worktree", "add", "/tmp/elsewhere"],
+            ["bisect", "run", "sh", "-c", "echo pwned"],
+            ["apply", "patch.diff"],
+            ["archive", "--remote=ssh://evil.example/x", "HEAD"],
+            ["update-ref", "refs/heads/main", "HEAD"],
+            ["daemon"],
+            ["co"],  # an alias, which would run whatever .git/config defines
+        ):
+            with self.assertRaises(ValueError, msg=" ".join(argv)) as ctx:
+                self._check(argv)
+            self.assertIn("blocked", str(ctx.exception).lower(), " ".join(argv))
+
 
 if __name__ == "__main__":
     unittest.main()

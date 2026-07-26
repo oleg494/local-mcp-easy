@@ -7,6 +7,7 @@ import contextlib
 import datetime as dt
 import fnmatch
 import functools
+import inspect
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.routes import REVOCATION_PATH, TOKEN_PATH
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -98,6 +101,19 @@ TEMP_FILE_TTL_SECONDS = int(os.environ.get("MCP_TEMP_FILE_TTL", "") or 24 * 60 *
 ORPHAN_SWEEP_MIN_INTERVAL_SECONDS = 60.0
 REPO_CONTEXT_FILE = "agent-repo-config.local.json"
 REPO_CONTEXT_SCHEMA_VERSION = 3
+
+# Read-only mode (2.4.0): refuse to register any tool that can change something.
+# The point is a hard guarantee, not a policy the caller can argue with -- the
+# write and command tools are never registered at all, so no scope grant, token
+# replay or client bug can reach them. Intended for exposing a workspace over a
+# tunnel for review/inspection.
+READ_ONLY = os.environ.get("MCP_READ_ONLY", "0").strip().lower() in {"1", "true", "yes"}
+
+# Audit log (2.4.0): one append-only JSON line per tool call. A server reachable
+# from the internet with command execution needs a record of what ran; nothing
+# else in the process keeps one. Empty value disables it.
+AUDIT_LOG_PATH = os.environ.get("MCP_AUDIT_LOG", "").strip()
+_audit_lock = threading.Lock()
 
 if not TOKEN:
     raise RuntimeError("MCP_TOKEN is required")
@@ -192,10 +208,27 @@ mcp = FastMCP(
     **_fastmcp_auth_kwargs,
 )
 
+# The server's own secrets. Any tool result echoing one of these back would
+# hand a client the credentials it was never granted -- `grep_files` over a
+# stray .env, `run_command` printing the environment, a traceback quoting a
+# config file. Short values are excluded: redacting a 3-character string would
+# mangle unrelated output for no security benefit.
+_SECRETS = tuple(
+    value for value in (TOKEN, OWNER_CODE) if isinstance(value, str) and len(value) >= 8
+)
+
+
+def _redact_secrets(text: str) -> str:
+    for secret in _SECRETS:
+        if secret in text:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
 def _clip(text) -> str:
     if text is None:
         return "(no output)"
-    text = str(text)
+    text = _redact_secrets(str(text))
     if text == "":
         return "(empty result)"
     if len(text) > MAX_OUTPUT_CHARS:
@@ -205,6 +238,35 @@ def _clip(text) -> str:
             f"{MAX_OUTPUT_CHARS:,}. Use offset/limit or a narrower query to see more.]"
         )
     return text
+
+
+def _audit(tool_name: str, arguments: dict, outcome: str, detail: str = "") -> None:
+    """Append one JSON line describing a tool call. Never raises.
+
+    Arguments are recorded, values truncated -- knowing that write_file was
+    called on config.py matters; the 2 MB body does not. An audit log that can
+    crash the tool it audits is worse than none, hence the blanket suppression.
+    """
+    if not AUDIT_LOG_PATH:
+        return
+    with contextlib.suppress(Exception):
+        record = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "client": _current_client_id(),
+            "tool": tool_name,
+            "outcome": outcome,
+            "args": {
+                key: _redact_secrets(str(value))[:200]
+                for key, value in sorted(arguments.items())
+            },
+        }
+        if detail:
+            record["detail"] = _redact_secrets(detail)[:300]
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        # One process, several worker threads: serialize so concurrent tool
+        # calls cannot interleave partial lines in the file.
+        with _audit_lock, open(AUDIT_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(line)
 
 
 def _require_scope(scope: str) -> None:
@@ -230,17 +292,81 @@ def _require_scope(scope: str) -> None:
         )
 
 
-def tool(scope: str):
-    """Like @mcp.tool() but enforces an OAuth scope and clips every result."""
+# Scopes that can change something. In read-only mode their tools are never
+# registered, so the guarantee does not depend on scope checks holding.
+WRITE_SCOPES = frozenset({SCOPE_FILES_WRITE, SCOPE_COMMANDS_RUN, SCOPE_GIT})
+
+
+def tool(
+    scope: str,
+    *,
+    read_only: bool | None = None,
+    destructive: bool = False,
+    idempotent: bool = False,
+    open_world: bool = False,
+):
+    """Like @mcp.tool() but enforces an OAuth scope, audits, and clips results.
+
+    The annotations are MCP tool hints a client uses to decide what it may run
+    without asking the user (readOnlyHint), what needs confirmation
+    (destructiveHint), and what is safe to retry (idempotentHint).
+
+    read_only defaults to "the scope cannot change anything". Pass read_only=True
+    explicitly only for a tool that holds a write scope purely for authorization
+    but genuinely mutates nothing (the git inspection tools need mcp:git to be
+    reachable at all, yet only run read-only git queries). That flag also decides
+    whether the tool exists in read-only mode, so it is the one thing here worth
+    getting right.
+
+    In read-only mode a mutating tool is not registered at all and the decorator
+    returns the undecorated function, so `mcp.list_tools()` never advertises it
+    and no request can reach it -- the guarantee does not rest on scope checks.
+    """
     if scope not in ALL_SCOPES:
         raise RuntimeError(f"Tool registered with unknown scope: {scope}")
+    if read_only is None:
+        read_only = scope not in WRITE_SCOPES
+    if destructive and read_only:
+        raise RuntimeError("A read-only tool cannot also be destructive")
 
     def deco(fn):
+        if READ_ONLY and not read_only:
+            return fn
+
+        # Bound once at import: the audit log must name every argument even
+        # when a caller passes it positionally, and re-deriving the signature
+        # per call would put inspect on the hot path.
+        signature = inspect.signature(fn)
+
+        def _named(args, kwargs) -> dict:
+            try:
+                bound = signature.bind(*args, **kwargs)
+            except TypeError:
+                return dict(kwargs)
+            return dict(bound.arguments)
+
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
             _require_scope(scope)
-            return _clip(await fn(*args, **kwargs))
-        return mcp.tool()(wrapper)
+            try:
+                result = _clip(await fn(*args, **kwargs))
+            except Exception as exc:
+                _audit(fn.__name__, _named(args, kwargs), "error", f"{type(exc).__name__}: {exc}")
+                raise
+            _audit(fn.__name__, _named(args, kwargs), "ok")
+            return result
+
+        return mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                # Nothing here reaches beyond the local workspace except the
+                # git transport commands, which talk to the configured remote.
+                openWorldHint=open_world,
+            )
+        )(wrapper)
+
     return deco
 
 
@@ -2117,11 +2243,14 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(proc.wait(), timeout=5)
 
 
-@tool(scope=SCOPE_FILES_READ)
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
 async def workspace_info() -> str:
     """Show the allowed workspace, active mode, and git repo-context status."""
     commands = ", ".join(sorted(ALLOWED_COMMANDS)) if ALLOW_COMMANDS else "disabled"
     mode = "trusted developer mode" if ALLOW_COMMANDS else "file-only mode"
+    if READ_ONLY:
+        mode = "read-only mode (write and command tools are not registered)"
+        commands = "disabled"
     repo_overview = await asyncio.to_thread(_workspace_repo_overview, BASE_DIR)
     return (
         f"workspace: {BASE_DIR}\nmode: {mode}\ncommands: {commands}\n"
@@ -2131,7 +2260,7 @@ async def workspace_info() -> str:
     )
 
 
-@tool(scope=SCOPE_GIT)
+@tool(scope=SCOPE_GIT, read_only=True, idempotent=True)
 async def repo_context_status(cwd: str = ".") -> str:
     """Show the current repo-context configuration, git detection, and next setup step."""
     workdir = _path(cwd)
@@ -2140,7 +2269,7 @@ async def repo_context_status(cwd: str = ".") -> str:
     return await asyncio.to_thread(_repo_context_summary, workdir)
 
 
-@tool(scope=SCOPE_GIT)
+@tool(scope=SCOPE_GIT, read_only=True, idempotent=True)
 async def inspect_git_repository(cwd: str = ".") -> str:
     """Inspect the git repository in this workspace without running any mutating git command."""
     workdir = _path(cwd)
@@ -2149,7 +2278,7 @@ async def inspect_git_repository(cwd: str = ".") -> str:
     return await asyncio.to_thread(_inspect_git_repository_text, workdir)
 
 
-@tool(scope=SCOPE_GIT)
+@tool(scope=SCOPE_GIT, idempotent=True)
 async def configure_repo_context(
     repository_url: str,
     is_fork: bool,
@@ -2213,7 +2342,7 @@ async def configure_repo_context(
     return f"Saved repo context to {config_path.relative_to(BASE_DIR)}\n\n{summary}"
 
 
-@tool(scope=SCOPE_GIT)
+@tool(scope=SCOPE_GIT, idempotent=True, open_world=True)
 async def setup_git_context(
     mode: str,
     repository_url: str = "",
@@ -2251,7 +2380,7 @@ async def setup_git_context(
     )
 
 
-@tool(scope=SCOPE_FILES_READ)
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
 async def list_dir(
     path: str = ".",
     recursive: bool = False,
@@ -2308,7 +2437,7 @@ async def list_dir(
     return await asyncio.to_thread(_list)
 
 
-@tool(scope=SCOPE_FILES_READ)
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
 async def file_info(path: str) -> str:
     """Show file or directory metadata."""
     item = _path(path)
@@ -2359,8 +2488,36 @@ async def read_file(path: str, offset: int = 0, limit: int = 0, char_offset: int
     return await asyncio.to_thread(_read)
 
 
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
+async def tail_file(path: str, lines: int = 50) -> str:
+    """Read the last N lines of a text file, the way `tail -n` does.
 
-@tool(scope=SCOPE_FILES_WRITE)
+    Use this for log files and long command transcripts: read_file() counts
+    from the start, so following a growing file means recomputing an offset on
+    every poll.
+    """
+    item, _ = _resolve_read_file_path(path)
+    count = max(1, min(lines, DEFAULT_READ_LINES))
+
+    def _tail() -> str:
+        if not item.is_file():
+            raise ValueError(f"Not a file: {item}")
+        _text_file(item)
+        with item.open("rb") as handle:
+            if _is_binary_bytes(handle.read(8192)):
+                raise ValueError(f"Refusing to tail a binary file: {item.name}")
+        # _text_file caps the size at MAX_TEXT_FILE, so reading whole and
+        # slicing is bounded and far simpler than a reverse block scan.
+        text_lines = _read_text_with_replace(item).splitlines()
+        tail = text_lines[-count:]
+        first = len(text_lines) - len(tail) + 1
+        header = f"(last {len(tail)} of {len(text_lines)} lines, starting at line {first})"
+        return header + "\n" + "\n".join(tail)
+
+    return await asyncio.to_thread(_tail)
+
+
+@tool(scope=SCOPE_FILES_WRITE, destructive=True, idempotent=True)
 async def write_file(path: str, content: str, overwrite: bool = True) -> str:
     """Write a UTF-8 text file inside the workspace."""
     encoded_size = len(content.encode("utf-8"))
@@ -2402,7 +2559,7 @@ async def append_file(path: str, content: str) -> str:
     return f"Appended {len(content):,} characters to {item.relative_to(BASE_DIR)}"
 
 
-@tool(scope=SCOPE_FILES_WRITE)
+@tool(scope=SCOPE_FILES_WRITE, destructive=True)
 async def edit_file(
     path: str,
     old_string: str,
@@ -2441,7 +2598,7 @@ async def edit_file(
     return f"Replaced {count} occurrence(s) in {item.relative_to(BASE_DIR)}"
 
 
-@tool(scope=SCOPE_FILES_WRITE)
+@tool(scope=SCOPE_FILES_WRITE, idempotent=True)
 async def create_dir(path: str) -> str:
     """Create a directory and missing parents. Existing directories are accepted."""
     item = _path(path)
@@ -2450,7 +2607,7 @@ async def create_dir(path: str) -> str:
     return f"Directory ready: {item.relative_to(BASE_DIR)}"
 
 
-@tool(scope=SCOPE_FILES_WRITE)
+@tool(scope=SCOPE_FILES_WRITE, destructive=True, idempotent=True)
 async def delete_file(path: str) -> str:
     """Delete one file or one empty directory. Recursive deletion is unavailable."""
     item = _path(path)
@@ -2481,7 +2638,7 @@ def _ensure_copy_move_size(source: Path) -> None:
         )
 
 
-@tool(scope=SCOPE_FILES_WRITE)
+@tool(scope=SCOPE_FILES_WRITE, destructive=True)
 async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Copy one file inside the workspace."""
     source, target = _path(src), _path(dst)
@@ -2496,7 +2653,7 @@ async def copy_file(src: str, dst: str, overwrite: bool = False) -> str:
     return f"Copied {source.relative_to(BASE_DIR)} -> {target.relative_to(BASE_DIR)}"
 
 
-@tool(scope=SCOPE_FILES_WRITE)
+@tool(scope=SCOPE_FILES_WRITE, destructive=True)
 async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     """Move or rename one file inside the workspace."""
     source, target = _path(src), _path(dst)
@@ -2513,7 +2670,7 @@ async def move_file(src: str, dst: str, overwrite: bool = False) -> str:
     return f"Moved {source.relative_to(BASE_DIR)} -> {target.relative_to(BASE_DIR)}"
 
 
-@tool(scope=SCOPE_FILES_READ)
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
 async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> str:
     """Find workspace files using a glob such as **/*.py."""
     root = _path(path)
@@ -2535,7 +2692,7 @@ async def glob_files(pattern: str, path: str = ".", max_results: int = 300) -> s
     return await asyncio.to_thread(_glob)
 
 
-@tool(scope=SCOPE_FILES_READ)
+@tool(scope=SCOPE_FILES_READ, idempotent=True)
 async def grep_files(
     pattern: str,
     path: str = ".",
@@ -2720,7 +2877,7 @@ def _format_command_result(
     )
 
 
-@tool(scope=SCOPE_COMMANDS_RUN)
+@tool(scope=SCOPE_COMMANDS_RUN, destructive=True, open_world=True)
 async def run_command(
     program: str,
     args: list[str] | None = None,
@@ -2912,7 +3069,7 @@ async def _run_job(job: CommandJob) -> None:
             job.finished_at = _now()
 
 
-@tool(scope=SCOPE_COMMANDS_RUN)
+@tool(scope=SCOPE_COMMANDS_RUN, destructive=True, open_world=True)
 async def start_command(
     program: str,
     args: list[str] | None = None,
@@ -2958,7 +3115,7 @@ async def start_command(
     )
 
 
-@tool(scope=SCOPE_COMMANDS_RUN)
+@tool(scope=SCOPE_COMMANDS_RUN, read_only=True)
 async def get_command_status(job_id: str) -> str:
     """Return the status, and the final output once finished, of a background job."""
     _prune_jobs()
@@ -2994,7 +3151,7 @@ async def get_command_status(job_id: str) -> str:
     return await asyncio.to_thread(_direct_or_saved_output, "get-command-status", header + result)
 
 
-@tool(scope=SCOPE_COMMANDS_RUN)
+@tool(scope=SCOPE_COMMANDS_RUN, destructive=True, idempotent=True)
 async def cancel_command(job_id: str) -> str:
     """Kill a running background job's process tree and mark it cancelled."""
     _prune_jobs()
@@ -3010,7 +3167,7 @@ async def cancel_command(job_id: str) -> str:
     return f"job {job.job_id}: cancelled."
 
 
-@tool(scope=SCOPE_COMMANDS_RUN)
+@tool(scope=SCOPE_COMMANDS_RUN, read_only=True, idempotent=True)
 async def list_commands() -> str:
     """List tracked background command jobs (id, status, elapsed, command)."""
     _prune_jobs()
@@ -3368,6 +3525,10 @@ if __name__ == "__main__":
     print(f"Workspace: {BASE_DIR}")
     print(f"Commands: {'trusted developer mode' if ALLOW_COMMANDS else 'file-only mode'}")
     print(f"Auth mode: {AUTH_MODE}")
+    if READ_ONLY:
+        print("READ-ONLY: write and command tools are not registered at all")
+    if AUDIT_LOG_PATH:
+        print(f"Audit log: {AUDIT_LOG_PATH}")
     if OAUTH_ENABLED:
         print(f"OAuth issuer: {PUBLIC_URL}")
         print(f"OAuth resource: {resource_url_for(PUBLIC_URL)}")
