@@ -142,10 +142,18 @@ class MemoryStore:
         memory. Cheaper to refuse than to escape, since a lone section sign on
         its own line is never something a real memory needs.
         """
-        content = (content or "").strip()
+        # Line endings are normalised *before* the check, and only the
+        # normalised form is ever stored. The store is read back with
+        # Path.read_text() in universal-newline mode, so a smuggled "\u00a7\r"
+        # line would slip past an exact-match guard, be written verbatim
+        # (atomic_write_text uses newline="") and then be translated back into a
+        # lone "\u00a7" line on the next read -- splitting one write into two
+        # independent entries, which is precisely the forgery this guard exists
+        # to prevent. Validate what the reader will see, store only that.
+        content = (content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not content:
             raise MemoryError_(f"{label} is required")
-        if ENTRY_DELIMITER.strip("\n") in content.split("\n"):
+        if ENTRY_DELIMITER.strip("\n") in content.splitlines():
             raise MemoryError_(
                 "An entry cannot contain a line that is only '§' — that is the "
                 "separator between entries. Rephrase, or use two writes."

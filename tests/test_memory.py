@@ -330,5 +330,68 @@ class ServerToolTests(unittest.TestCase):
         self.assertNotIn("## Memory", srv._build_instructions())
 
 
+class DelimiterSmugglingTests(unittest.TestCase):
+    """CR/CRLF must not rebuild the entry delimiter after the guard ran.
+
+    render_all() is spliced into the server's instructions, i.e. the client's
+    system prompt, so an entry that splits itself in two on the next read is a
+    durable prompt-injection primitive: it lets one write present a short,
+    clean-looking fragment as an independently remembered fact.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self._tmp.name)
+        self.store = MemoryStore(self.directory)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_crlf_delimiter_line_is_refused(self):
+        with self.assertRaises(MemoryError_):
+            self.store.add(
+                "memory", "attacker line one\n\u00a7\r\nsmuggled second entry"
+            )
+
+    def test_a_bare_cr_delimiter_line_is_refused(self):
+        with self.assertRaises(MemoryError_):
+            self.store.add(
+                "memory", "attacker line one\r\u00a7\rsmuggled second entry"
+            )
+
+    def test_a_crlf_entry_stays_one_entry_after_reload(self):
+        self.store.add("memory", "first line\r\nsecond line")
+        self.assertEqual(len(self.store.entries("memory")), 1)
+        # A fresh store re-reads the file in universal-newline mode. The entry
+        # count must not change just because the write carried CRLF.
+        self.assertEqual(len(MemoryStore(self.directory).entries("memory")), 1)
+
+    def test_no_carriage_return_ever_reaches_the_file(self):
+        self.store.add("memory", "first line\r\nsecond line")
+        self.assertNotIn(b"\r", self.store.path("memory").read_bytes())
+
+
+class ScopeDisclosureTests(unittest.TestCase):
+    """The consent screen must admit that the file scopes also reach memory."""
+
+    def test_default_file_scopes_disclose_memory_and_skills(self):
+        from auth import (
+            DEFAULT_SCOPES,
+            SCOPE_DESCRIPTIONS,
+            SCOPE_FILES_READ,
+            SCOPE_FILES_WRITE,
+        )
+
+        # These two are exactly what a client receives by registering without
+        # requesting any scope, which is why the wording has to be honest.
+        self.assertEqual(set(DEFAULT_SCOPES), {SCOPE_FILES_READ, SCOPE_FILES_WRITE})
+        read = SCOPE_DESCRIPTIONS[SCOPE_FILES_READ].lower()
+        write = SCOPE_DESCRIPTIONS[SCOPE_FILES_WRITE].lower()
+        for text in (read, write):
+            self.assertIn("memory", text)
+            self.assertIn("outside the workspace", text)
+        self.assertIn("skill", read)
+
+
 if __name__ == "__main__":
     unittest.main()

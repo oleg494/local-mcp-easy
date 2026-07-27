@@ -33,6 +33,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import is_inside
+
 SKILL_FILE = "SKILL.md"
 SUPPORT_DIRS = ("references", "scripts", "assets")
 # Limits from the agentskills.io spec. Over-long values are truncated rather
@@ -62,6 +64,11 @@ class Skill:
     origin: str  # "user" or "workspace"
     meta: dict
     body: str
+    # The configured root this skill was discovered under, kept so containment
+    # can be re-checked against that root instead of against the skill
+    # directory's own resolved path -- which a junction or symlink would
+    # redefine to point at whatever the attacker chose.
+    root: Path | None = None
 
     @property
     def trusted(self) -> bool:
@@ -150,7 +157,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
-def _load_skill(skill_dir: Path, origin: str) -> Skill | None:
+def _load_skill(skill_dir: Path, origin: str, root: Path | None = None) -> Skill | None:
     """Read one skill directory, or None when it is not a readable skill."""
     path = skill_dir / SKILL_FILE
     try:
@@ -164,7 +171,11 @@ def _load_skill(skill_dir: Path, origin: str) -> Skill | None:
     name = skill_dir.name.strip()
     if not name or len(name) > MAX_NAME:
         return None
-    description = str(meta.get("description", "")).strip()[:MAX_DESCRIPTION]
+    # Flattened once, here, so every consumer gets a single-line value. A
+    # block-scalar description carries real newlines, and both the index and
+    # the skill_view header are line-oriented text the model reads as trusted
+    # server output -- see _one_line().
+    description = _one_line(str(meta.get("description", "")))[:MAX_DESCRIPTION]
     return Skill(
         name=name,
         description=description,
@@ -172,6 +183,7 @@ def _load_skill(skill_dir: Path, origin: str) -> Skill | None:
         origin=origin,
         meta=meta,
         body=body,
+        root=root,
     )
 
 
@@ -193,7 +205,14 @@ def discover(roots: list[tuple[Path, str]]) -> list[Skill]:
                 continue
             if entry.name in found or len(found) >= MAX_SKILLS:
                 continue
-            skill = _load_skill(entry, origin)
+            if not is_inside(root, entry):
+                # A directory junction (mklink /J, no admin rights) or symlink
+                # is not reported by is_symlink() on Windows, so without this a
+                # planted reparse point becomes a skill whose own directory IS
+                # the attacker's target -- and every later containment check
+                # resolves through it and compares the target with itself.
+                continue
+            skill = _load_skill(entry, origin, root)
             if skill is not None:
                 found[skill.name] = skill
     return sorted(found.values(), key=lambda s: s.name)
@@ -232,8 +251,15 @@ def support_files(skill: Skill) -> list[str]:
             continue
         try:
             for path in sorted(directory.rglob("*")):
-                if path.is_file():
-                    files.append(path.relative_to(skill.directory).as_posix())
+                if not path.is_file():
+                    continue
+                if not is_inside(skill.directory, path):
+                    # rglob descends through a junction planted inside a support
+                    # directory. Listing what it points at would advertise a
+                    # skill_view(file_path=...) call for foreign files and leak
+                    # their names as if they belonged to the skill.
+                    continue
+                files.append(path.relative_to(skill.directory).as_posix())
         except OSError:
             continue
     return files
@@ -241,9 +267,13 @@ def support_files(skill: Skill) -> list[str]:
 
 def render_skill(skill: Skill) -> str:
     """Level 2: the skill body, plus pointers to level 3. Never inlines them."""
-    header = [f"# Skill: {skill.name}"]
+    header = [f"# Skill: {_one_line(skill.name)}"]
     if skill.description:
-        header.append(f"description: {skill.description}")
+        # Flattened here too, not only in _load_skill: this header is
+        # line-oriented, and a description carrying newlines could otherwise
+        # forge a header line of its own (e.g. a fake "source:" line claiming
+        # the skill is trusted) right where the real provenance banner goes.
+        header.append(f"description: {_one_line(skill.description)}")
     if not skill.trusted:
         header.append(
             "source: this skill comes from the WORKSPACE, not from your "
@@ -271,14 +301,20 @@ def resolve_support_file(skill: Skill, file_path: str) -> Path:
     guard does not cover it; this is the equivalent containment check for a
     path the client supplies.
     """
-    candidate = (skill.directory / file_path).resolve()
-    root = skill.directory.resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
+    if skill.root is not None and not is_inside(skill.root, skill.directory):
+        # The skill directory is itself a reparse point leaving its configured
+        # root, so its resolved path cannot serve as the boundary: checking a
+        # candidate against it would compare the attacker's target with itself
+        # and let any file under that target through.
+        raise SkillError(
+            f"Access denied: the '{skill.name}' skill directory resolves "
+            "outside its skill root."
+        )
+    if not is_inside(skill.directory, skill.directory / file_path):
         raise SkillError(
             f"Access denied: {file_path!r} is outside the '{skill.name}' skill."
-        ) from exc
+        )
+    candidate = (skill.directory / file_path).resolve()
     if not candidate.is_file():
         raise SkillError(f"No such file in the '{skill.name}' skill: {file_path}")
     return candidate
