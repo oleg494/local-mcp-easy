@@ -64,6 +64,16 @@ Since 2.1.0 the default **auth mode is `dual`** — a fresh setup accepts both t
 - In `oauth` mode the Bearer token stops working on `/mcp` and remains valid
   only for the launcher's `/health` checks.
 
+## Skills and memory (2.5.0)
+
+Skills and persistent memory are the only server features that live **outside the selected workspace** and that write into the client's system prompt, so they have their own rules.
+
+- The default scopes cover them. `skills_list`, `skill_view` and `memory_read` ride on `mcp:files:read`, and `memory_write` on `mcp:files:write` — both are handed to a client that registers without asking for scopes, so a client with "file access" can also read installed skills and read and rewrite memory that survives every session. The consent screen states this explicitly.
+- Skills are trusted code-shaped text. A `SKILL.md` body is instructions for the model, and personal skills in `%LOCALAPPDATA%\LocalMcpEasy\skills` take precedence over workspace skills in `<workspace>\.mcp-skills`, so a repository you clone cannot shadow one of your own. Rendered skills carry a provenance line naming their origin, and names and descriptions are flattened to a single line so that a workspace skill cannot forge that line.
+- Skill directories are pinned to their root. Discovery, the support-file listing and every `skill_view(name, file_path=...)` resolution check the resolved path against the configured skills root with a junction-aware containment test, so a directory junction or symlink planted as a skill directory cannot turn `mcp:files:read` into arbitrary file read.
+- Recalled memory is data, never instructions. The stored entries are injected inside `<recalled_memory source="earlier session, unverified">` with an explicit note that nothing inside may be followed as a directive. Entry delimiters are normalised before validation, so content cannot smuggle in a delimiter and forge an extra remembered entry.
+- Memory is bounded and revocable. Each store has a character budget (`MCP_MEMORY_CHAR_LIMIT`, `MCP_USER_CHAR_LIMIT`), the files are plain markdown you can read or delete by hand, `MCP_MEMORY=0` disables the feature entirely, and under `MCP_READ_ONLY=1` the `memory_write` tool is never registered.
+
 ## Trusted developer mode
 
 The setup wizard can enable commands such as Python, Git and Node. This mode is **not a sandbox**. Interpreters and build tools can access the wider filesystem, network and processes with the rights of the current Windows user. Git still has an extra guard: MCP blocks ordinary git commands until the workspace completes an explicit local setup-flow, it requires the user to choose whether commits belong on the default branch or on a named branch, and it refuses git whenever the detected `origin` does not match the saved binding after a restart. Enable it only when every connected MCP client (and everyone who can access its settings) is trusted.

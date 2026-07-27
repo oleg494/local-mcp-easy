@@ -89,8 +89,8 @@ Back and retry Connect; the server shows a friendly hint page for this case.
 
 | Scope | Tools |
 | --- | --- |
-| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `glob_files`, `grep_files` |
-| `mcp:files:write` | `write_file`, `append_file`, `edit_file`, `create_dir`, `delete_file`, `copy_file`, `move_file` |
+| `mcp:files:read` | `workspace_info`, `list_dir`, `file_info`, `read_file`, `tail_file`, `glob_files`, `grep_files`, `skills_list`, `skill_view`, `memory_read` |
+| `mcp:files:write` | `write_file`, `append_file`, `edit_file`, `create_dir`, `delete_file`, `copy_file`, `move_file`, `memory_write` |
 | `mcp:commands:run` | `run_command` (also requires trusted developer mode) |
 | `mcp:git` | `repo_context_status`, `inspect_git_repository`, `configure_repo_context`, `setup_git_context` |
 
@@ -100,6 +100,42 @@ register without requesting scopes get the least-privilege default
 system access** in trusted developer mode — grant it explicitly and only to
 fully trusted clients. For a single-owner setup you can also pin a fixed
 grant for every approved client via `MCP_OAUTH_OWNER_GRANT_SCOPES`.
+
+## Skills and memory (2.5.0)
+
+A skill is a folder with a `SKILL.md`: YAML frontmatter plus markdown instructions, following the portable core of the [agentskills.io](https://agentskills.io/specification) specification (`name`, `description`, optional `references/`, `scripts/` and `assets/`).
+
+```
+%LOCALAPPDATA%\LocalMcpEasy\skills\<name>\SKILL.md   ← personal, available in every workspace
+<workspace>\.mcp-skills\<name>\SKILL.md              ← project skills, this workspace only
+```
+
+Disclosure is progressive, so a large library costs almost no context:
+
+1. **Always** — one `name: description` line per skill, in the server instructions and in `skills_list()`.
+2. **On demand** — the `SKILL.md` body, via `skill_view(name)`.
+3. **On demand** — support files, listed at the end of the body with a `skill_view(name, file_path=...)` hint.
+
+Personal skills win over workspace skills of the same name, and each rendered skill states where it came from, so a cloned repository cannot quietly shadow one of your own.
+
+Memory is two flat markdown files in `%LOCALAPPDATA%\LocalMcpEasy\memory\`: `MEMORY.md` for what the agent learned about the project, `USER.md` for what it learned about you. Both are injected into the server instructions on every session, fenced as `<recalled_memory source="earlier session, unverified">` and explicitly labelled as data rather than instructions. Budgets are counted **in characters**, not entries (2200 for `MEMORY.md`, 1375 for `USER.md`), and `memory_read` always reports the current usage.
+
+| Tool | Scope | Purpose |
+| --- | --- | --- |
+| `skills_list()` | `mcp:files:read` | the skill index |
+| `skill_view(name, file_path="")` | `mcp:files:read` | a skill body or one of its support files |
+| `memory_read(target="all")` | `mcp:files:read` | current memory with its budget |
+| `memory_write(action, content, target, old_text)` | `mcp:files:write` | `add` / `replace` / `remove` |
+
+Note that the default file scopes reach both features, and they deliberately live outside the workspace — see [SECURITY.md](SECURITY.md). `MCP_MEMORY=0` disables memory entirely, and under `MCP_READ_ONLY=1` the `memory_write` tool is never registered.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MCP_SKILLS_DIR` | `<config>\skills` | personal skills folder |
+| `MCP_MEMORY_DIR` | `<config>\memory` | memory store folder |
+| `MCP_MEMORY` | `1` | `0` disables memory |
+| `MCP_MEMORY_CHAR_LIMIT` | `2200` | `MEMORY.md` budget in characters |
+| `MCP_USER_CHAR_LIMIT` | `1375` | `USER.md` budget in characters |
 
 ## Management
 
