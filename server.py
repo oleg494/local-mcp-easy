@@ -1772,10 +1772,96 @@ def _branch_target(args: list[str]) -> str:
 
 
 def _push_remote_and_refspecs(args: list[str]) -> tuple[str, list[str]]:
-    positionals = _command_positionals(args, {"-u", "--set-upstream", "--repo", "--receive-pack", "--exec", "-o", "--push-option"})
+    # `-u` / `--set-upstream` are flags, not options that take a value. Listing
+    # them as value-taking made the parser swallow the remote name, so
+    # `git push -u origin work` was analysed as a push to a remote called
+    # "work" and refused for a reason that had nothing to do with the command.
+    positionals = _command_positionals(args, {"--repo", "--receive-pack", "--exec", "-o", "--push-option"})
     if not positionals:
         return "", []
     return positionals[0], positionals[1:]
+
+
+def _is_git_branch_delete(args: list[str]) -> bool:
+    return any(flag in _expand_short_clusters(args) for flag in {"-d", "-D", "--delete"})
+
+
+def _branch_is_merged_into(
+    cwd: Path, branch: str, target_branch: str, git_args: list[str]
+) -> bool:
+    """True when every commit on `branch` is already reachable from the policy
+    branch, so deleting it cannot lose history."""
+    git_prefix, _ = _split_git_global_args(git_args)
+    query = _run_git_query(
+        cwd,
+        "merge-base",
+        "--is-ancestor",
+        f"refs/heads/{branch}",
+        f"refs/heads/{target_branch}",
+        git_prefix=git_prefix,
+    )
+    return query is not None and query.returncode == 0
+
+
+def _names_local_branch(cwd: Path, name: str, git_args: list[str]) -> bool:
+    """True when `name` is an existing local branch, so a checkout of it is
+    navigation rather than a pathspec restore of working-tree files."""
+    git_prefix, _ = _split_git_global_args(git_args)
+    query = _run_git_query(
+        cwd, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}", git_prefix=git_prefix
+    )
+    return query is not None and query.returncode == 0
+
+
+def _tag_refspec_target(refspec: str) -> str:
+    """The `refs/tags/...` destination of a push refspec, or "" when the refspec
+    is not an explicit tag push.
+
+    Only the fully qualified form counts: a bare `v1.2.3` is ambiguous between a
+    branch and a tag, and the policy never guesses which one the caller meant.
+    """
+    source, sep, target = refspec.partition(":")
+    candidate = target if sep else source
+    return candidate if candidate.startswith("refs/tags/") else ""
+
+
+def _ensure_tag_push_allowed(
+    cwd: Path, refspec: str, target_branch: str, git_args: list[str]
+) -> None:
+    """Allow publishing a release tag, but only the safe shape of it.
+
+    A tag whose commit is already reachable from the policy branch publishes
+    nothing the branch policy did not already allow, which is exactly what a
+    release needs. Everything else is refused: a forced update can move a tag
+    that other people have already fetched, a renaming refspec can publish one
+    object under an unrelated name, and a tag pointing outside the policy branch
+    would push history the policy never approved.
+    """
+    source, sep, target = refspec.partition(":")
+    if source.startswith("+"):
+        raise ValueError(
+            "Git is blocked because a forced tag update ('+...') can move a tag "
+            "that has already been published."
+        )
+    if sep and source != target:
+        raise ValueError(
+            f"Git is blocked because a tag push must not be renamed on the remote: {refspec}."
+        )
+    tag_ref = target if sep else source
+    git_prefix, _ = _split_git_global_args(git_args)
+    query = _run_git_query(
+        cwd,
+        "merge-base",
+        "--is-ancestor",
+        f"{tag_ref}^{{commit}}",
+        f"refs/heads/{target_branch}",
+        git_prefix=git_prefix,
+    )
+    if query is None or query.returncode != 0:
+        raise ValueError(
+            "Git is blocked because the tag does not point at a commit reachable "
+            f"from {target_branch}: {refspec}."
+        )
 
 
 def _git_config_value(
@@ -2015,8 +2101,27 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
         "cat-file",
         "blame",
         "grep",
+        # Ref and history inspection. These only read local refs and objects,
+        # but they were unclassified, so ordinary questions like "is this branch
+        # merged?" were refused as if they were writes.
+        "show-ref",
+        "for-each-ref",
+        "merge-base",
+        "rev-list",
+        "shortlog",
     }
     if subcommand in simple_read_only:
+        return
+
+    if subcommand == "ls-remote":
+        # Read-only, but it talks to a remote, so the remote itself still has to
+        # be one the repo context approved -- the same rule git fetch follows.
+        positionals = _command_positionals(
+            tail, {"-o", "--server-option", "--upload-pack", "--sort"}
+        )
+        _ensure_remote_reference_allowed(
+            positionals[0] if positionals else "", config, detected, context="git ls-remote"
+        )
         return
 
     if subcommand == "symbolic-ref":
@@ -2053,6 +2158,15 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
             return
         branch_target = _branch_target(tail)
         if branch_target and branch_target != target_branch:
+            # Deleting a branch whose commits are already reachable from the
+            # policy branch loses no history, and it is the only way to clean up
+            # after a merged pull request. Refusing it outright made the policy
+            # deadlock: the branch could neither be deleted from the policy
+            # branch, nor by pinning the policy to the branch being deleted.
+            if _is_git_branch_delete(tail) and _branch_is_merged_into(
+                cwd, branch_target, target_branch, git_args
+            ):
+                return
             raise ValueError(
                 f"Git is blocked because branch operations for this workspace must stay on {target_branch}, "
                 f"but the command targets {branch_target}."
@@ -2060,26 +2174,45 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
         _require_current_branch_matches(current_branch, target_branch)
         return
 
+    # Moving HEAD between existing local branches is navigation, not a write to
+    # history or to a remote: commit, merge, rebase, pull and push each enforce
+    # the policy branch on their own. Pinning navigation as well only meant that
+    # leaving the policy branch and returning to it were both refused.
     if subcommand == "checkout":
         branch_target = _checkout_target_branch(tail)
         if branch_target:
-            if branch_target != target_branch:
+            if branch_target == target_branch:
+                return
+            # `-B` (like `switch -C`) force-resets a branch that may already
+            # exist, discarding its commits: that is a write to another branch
+            # and stays refused, exactly like `git branch -f`.
+            if "-B" in _expand_short_clusters(tail):
                 raise ValueError(
-                    f"Git is blocked because checkout for this workspace must stay on {target_branch}, "
+                    f"Git is blocked because branch operations for this workspace must stay on {target_branch}, "
                     f"but the command targets {branch_target}."
                 )
-            return
+            # `git checkout <path>` restores working-tree files and must stay
+            # branch-bound, so only a name that really is a local branch (or a
+            # branch this command creates fresh) counts as navigation.
+            creates_branch = bool(
+                _first_branch_argument(tail, {"-b", "--orphan"})
+            )
+            if creates_branch or _names_local_branch(cwd, branch_target, git_args):
+                return
         _require_current_branch_matches(current_branch, target_branch)
         return
 
     if subcommand == "switch":
+        # `git switch` only ever names branches, never pathspecs.
         branch_target = _switch_target_branch(tail)
+        # `-C` force-resets a branch that may already exist, discarding its
+        # commits: a write to another branch, refused like `git branch -f`.
+        if "-C" in _expand_short_clusters(tail) and branch_target != target_branch:
+            raise ValueError(
+                f"Git is blocked because branch operations for this workspace must stay on {target_branch}, "
+                f"but the command targets {branch_target}."
+            )
         if branch_target:
-            if branch_target != target_branch:
-                raise ValueError(
-                    f"Git is blocked because switch for this workspace must stay on {target_branch}, "
-                    f"but the command targets {branch_target}."
-                )
             return
         _require_current_branch_matches(current_branch, target_branch)
         return
@@ -2128,6 +2261,9 @@ def _ensure_git_context_for_command(cwd: Path, git_args: list[str] | None = None
             )
         _ensure_remote_reference_allowed(remote_target, config, detected, context="git push")
         for refspec in refspecs:
+            if _tag_refspec_target(refspec):
+                _ensure_tag_push_allowed(cwd, refspec, target_branch, git_args)
+                continue
             ref_target = _refspec_target_branch(refspec, current_branch)
             if ref_target != target_branch:
                 raise ValueError(

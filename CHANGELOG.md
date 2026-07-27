@@ -1,5 +1,89 @@
 # Changelog
 
+## 2.5.1 — 2026-07-27 (The git policy stops deadlocking against itself)
+
+The repo-context policy exists so an agent cannot commit to the wrong branch or
+push to the wrong repository. Using it for a full release cycle showed that it
+also refused a series of operations that write nothing outside the approved
+branch — and in one case refused them under *every* possible configuration, so
+the policy had made an ordinary workflow impossible rather than unsafe.
+
+Every case below was reproduced against the running server before it was fixed,
+and each fix is pinned by a regression test named after the failure scenario in
+`tests/test_git_hardening.py`. Nothing that was refused for a security reason
+became allowed: force pushes, `--tags`/`--follow-tags`, `+refspec` updates,
+empty-source deletions, foreign remotes, and the default-deny of unclassified
+subcommands (`update-ref`, `submodule`, `clone`, `worktree`, aliases, …) all
+behave exactly as before.
+
+### Fixed — a merged branch could never be deleted
+
+Deleting a local branch after its pull request was merged was refused from the
+policy branch, because the command "targets" a branch other than the configured
+one. Pinning the policy to the branch being deleted did not help either: then
+every git command was refused while HEAD was still on the policy branch. The two
+rules closed a loop with no exit, so merged branches accumulated forever and had
+to be removed by hand outside the server.
+
+`git branch -d/-D <branch>` is now allowed when every commit on that branch is
+already reachable from the policy branch, verified with `merge-base
+--is-ancestor` rather than assumed. Such a deletion cannot lose history — the
+commits survive on the policy branch. A branch with unmerged commits is still
+refused, as is renaming or moving another branch, and `--set-upstream-to` stays
+pinned because it changes where a later push would land.
+
+### Fixed — moving between local branches was treated as a write
+
+`git switch`/`git checkout` of another local branch was refused, which meant the
+workspace could never leave the policy branch and, once off it, could never come
+back. Moving HEAD writes nothing to history or to a remote, and every operation
+that does write — commit, merge, rebase, cherry-pick, pull, push — enforces the
+policy branch on its own, so navigation is now allowed on its own terms.
+
+The distinction that matters is kept: `git checkout -- <path>` restores
+working-tree files, so a name is treated as navigation only when it really is an
+existing local branch (`rev-parse --verify refs/heads/<name>`) or when the
+command creates one with `-b`/`-c`/`--orphan`. A pathspec checkout off the policy
+branch, and a commit off the policy branch, are both still refused. `-B`/`-C` are
+deliberately excluded from that allowance: unlike `-b`/`-c`, they succeed on a
+branch that already exists by force-resetting it to HEAD, which discards commits
+from another branch and is a write, not navigation.
+
+### Fixed — a release tag could not be published
+
+Pushing `refs/tags/vX.Y.Z` was refused because the refspec's destination is not
+the policy branch, so publishing a release required a detour through the GitHub
+API to have the tag created server-side.
+
+An explicit tag push is now allowed when the tag's commit is already reachable
+from the policy branch: it publishes nothing the branch policy had not already
+approved. The unsafe shapes stay refused — a forced update (`+refs/tags/...`)
+that could move a tag other people have already fetched, a renaming refspec
+(`refs/tags/a:refs/tags/b`) that would publish one object under an unrelated
+name, a tag pointing at commits outside the policy branch, and a bare `vX.Y.Z`
+whose meaning is ambiguous between a tag and a branch, which the policy never
+guesses.
+
+### Fixed — `git push -u` was misparsed
+
+`-u`/`--set-upstream` were listed as options that take a value, so the parser
+consumed the remote name as the flag's argument and analysed `git push -u origin
+work` as a push to a remote called `work`. The refusal message named the wrong
+problem entirely. They are flags and are now parsed as such; the branch check
+itself is unchanged, so `git push -u origin <other-branch>` is still refused.
+
+### Fixed — read-only ref inspection was denied by default
+
+`ls-remote`, `show-ref`, `for-each-ref`, `merge-base`, `rev-list` and `shortlog`
+were never classified, so the default-deny rule blocked questions as harmless as
+"is this branch merged?". They are read-only and are now allowed. `ls-remote`
+contacts a remote, so it additionally validates that remote against the approved
+repo context, exactly as `git fetch` does.
+
+### Tests
+
+- 469 → 483.
+
 ## 2.5.0 — 2026-07-26 (Agent skills and persistent memory)
 
 Two things an autonomous agent usually has and an MCP server usually does not: a

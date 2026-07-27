@@ -78,6 +78,17 @@ class GitHardeningTests(unittest.TestCase):
     def _check(self, args):
         self.server._ensure_git_context_for_command(self.workspace, list(args))
 
+    def _git(self, *args):
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            cwd=self.workspace, check=True, capture_output=True,
+        )
+
+    def _commit(self, name):
+        (self.workspace / name).write_text(name, encoding="utf-8")
+        self._git("add", name)
+        self._git("commit", "-m", f"add {name}")
+
     # -- Fix 2: dangerous global options + config --edit ------------------
     def test_dash_c_core_editor_config_edit_refused(self):
         with self.assertRaises(ValueError) as ctx:
@@ -291,6 +302,131 @@ class GitHardeningTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=" ".join(argv)) as ctx:
                 self._check(argv)
             self.assertIn("blocked", str(ctx.exception).lower(), " ".join(argv))
+
+    # -- 2.5.1: the branch pin deadlocked the policy against itself -------
+    # Each case below was reproduced against the live server first: the policy
+    # refused an operation that writes nothing outside the approved branch, and
+    # in the branch-cleanup case there was no configuration at all under which
+    # the operation could succeed.
+    def test_ls_remote_on_approved_remote_allowed(self):
+        # Read-only, but previously unclassified, so it was denied by default.
+        self._check(["ls-remote", "origin"])
+        self._check(["ls-remote", "--heads", "origin"])
+
+    def test_ls_remote_on_foreign_remote_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["ls-remote", "https://evil.example/repo.git"])
+        self.assertIn("blocked", str(ctx.exception).lower())
+
+    def test_ref_inspection_commands_allowed(self):
+        for argv in (
+            ["show-ref"],
+            ["for-each-ref", "--format=%(refname)"],
+            ["merge-base", "--is-ancestor", "HEAD", "main"],
+            ["rev-list", "--count", "HEAD"],
+            ["shortlog", "-sn"],
+        ):
+            self._check(argv)
+
+    def test_push_set_upstream_does_not_swallow_the_remote(self):
+        # `-u` takes no value: parsing it as value-taking made "main" the remote.
+        self.assertEqual(
+            self.server._push_remote_and_refspecs(["-u", "origin", "main"]),
+            ("origin", ["main"]),
+        )
+        self._check(["push", "-u", "origin", "main"])
+
+    def test_push_set_upstream_off_policy_branch_still_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["push", "-u", "origin", "topic"])
+        self.assertIn("must stay on main", str(ctx.exception))
+
+    def test_delete_branch_merged_into_policy_branch_allowed(self):
+        # Cleaning up after a merged pull request used to be impossible: from
+        # main the command "targets" another branch, and pinning the policy to
+        # that branch refused every git command while HEAD was still on main.
+        self._commit("a.txt")
+        self._git("branch", "topic")
+        self._check(["branch", "-D", "topic"])
+        self._check(["branch", "-d", "topic"])
+
+    def test_delete_branch_with_unmerged_commits_refused(self):
+        self._commit("a.txt")
+        self._git("switch", "-c", "topic")
+        self._commit("b.txt")
+        self._git("switch", "main")
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["branch", "-D", "topic"])
+        self.assertIn("must stay on main", str(ctx.exception))
+
+    def test_renaming_another_branch_still_refused(self):
+        self._commit("a.txt")
+        self._git("branch", "topic")
+        with self.assertRaises(ValueError):
+            self._check(["branch", "-m", "topic", "renamed"])
+
+    def test_navigation_between_local_branches_allowed(self):
+        self._commit("a.txt")
+        self._git("branch", "topic")
+        self._check(["switch", "topic"])
+        self._check(["checkout", "topic"])
+        self._check(["switch", "-c", "release/2.5.1"])
+        self._check(["checkout", "-b", "release/2.5.1"])
+
+    def test_force_resetting_another_branch_still_refused(self):
+        # `checkout -B` / `switch -C` point an existing branch at HEAD and throw
+        # its commits away: that is a write, not navigation.
+        self._commit("a.txt")
+        self._git("switch", "-c", "topic")
+        self._commit("b.txt")
+        self._git("switch", "main")
+        for argv in (["checkout", "-B", "topic"], ["switch", "-C", "topic"]):
+            with self.assertRaises(ValueError):
+                self._check(argv)
+
+    def test_writes_off_the_policy_branch_still_refused(self):
+        # Navigation is free, but everything that writes history or the working
+        # tree stays pinned -- and the way back to the policy branch is open.
+        self._commit("a.txt")
+        self._git("switch", "-c", "topic")
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["commit", "-m", "off-policy"])
+        self.assertIn("configured to work on main", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            self._check(["checkout", "--", "a.txt"])
+        self._check(["switch", "main"])
+
+    def test_tag_reachable_from_policy_branch_can_be_published(self):
+        # Publishing a release tag was impossible: the refspec "targets" a ref
+        # other than the policy branch, so the push was refused outright.
+        self._commit("a.txt")
+        self._git("tag", "-a", "v9.9.9", "-m", "release")
+        self._check(["push", "origin", "refs/tags/v9.9.9"])
+
+    def test_tag_outside_policy_branch_refused(self):
+        self._commit("a.txt")
+        self._git("switch", "-c", "topic")
+        self._commit("b.txt")
+        self._git("switch", "main")
+        self._git("tag", "-a", "v9.9.9", "-m", "release", "topic")
+        with self.assertRaises(ValueError) as ctx:
+            self._check(["push", "origin", "refs/tags/v9.9.9"])
+        self.assertIn("reachable", str(ctx.exception))
+
+    def test_unsafe_tag_push_shapes_refused(self):
+        self._commit("a.txt")
+        self._git("tag", "-a", "v9.9.9", "-m", "release")
+        # Forced update can move a tag other people already fetched.
+        with self.assertRaises(ValueError):
+            self._check(["push", "origin", "+refs/tags/v9.9.9"])
+        with self.assertRaises(ValueError):
+            self._check(["push", "origin", "+refs/tags/v9.9.9:refs/tags/v9.9.9"])
+        # Publishing one object under an unrelated name.
+        with self.assertRaises(ValueError):
+            self._check(["push", "origin", "refs/tags/v9.9.9:refs/tags/v1.0.0"])
+        # A bare name is ambiguous between a tag and a branch; never guess.
+        with self.assertRaises(ValueError):
+            self._check(["push", "origin", "v9.9.9"])
 
 
 if __name__ == "__main__":
