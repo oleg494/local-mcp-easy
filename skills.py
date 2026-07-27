@@ -81,6 +81,22 @@ def _strip_quotes(value: str) -> str:
     return value
 
 
+def _split_key_value(text: str) -> tuple[str, str, str]:
+    """Split `key: value`, honouring a quoted key that contains a colon.
+
+    A bare partition(":") splits '"a:b": v' after `a`, inventing the key '"a'
+    and dropping the rest of the line into the value.
+    """
+    if text[:1] in ('"', "'"):
+        closing = text.find(text[0], 1)
+        if closing > 0:
+            after = text[closing + 1:].lstrip()
+            if after.startswith(":"):
+                return text[: closing + 1], ":", after[1:]
+            return text[: closing + 1], "", ""
+    return text.partition(":")
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """Split `---`-fenced YAML frontmatter from the markdown body.
 
@@ -110,9 +126,20 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         nonlocal block_key, block_lines
         if block_key is None:
             return
-        joined = (" " if block_fold else "\n").join(
-            line.strip() if block_fold else line for line in block_lines
-        )
+        if block_fold:
+            # In real YAML a blank line inside a folded (">") scalar is a
+            # paragraph break, not a space. Space-joining every line ran the
+            # paragraphs of a long description together into one run-on line.
+            joined = ""
+            for line in block_lines:
+                if not line.strip():
+                    joined = joined.rstrip() + "\n"
+                elif joined and not joined.endswith("\n"):
+                    joined += " " + line.strip()
+                else:
+                    joined += line.strip()
+        else:
+            joined = "\n".join(block_lines)
         meta[block_key] = joined.strip()
         block_key, block_lines = None, []
 
@@ -128,10 +155,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
             continue
 
         indented = raw.startswith((" ", "\t"))
-        key, sep, value = raw.strip().partition(":")
+        key, sep, value = _split_key_value(raw.strip())
         if not sep:
             continue
-        key, value = key.strip(), value.strip()
+        key, value = _strip_quotes(key.strip()), value.strip()
 
         if indented and parent:
             # One level of nesting is enough for `metadata:`; deeper structure
@@ -175,7 +202,15 @@ def _load_skill(skill_dir: Path, origin: str, root: Path | None = None) -> Skill
     # block-scalar description carries real newlines, and both the index and
     # the skill_view header are line-oriented text the model reads as trusted
     # server output -- see _one_line().
-    description = _one_line(str(meta.get("description", "")))[:MAX_DESCRIPTION]
+    # Only a string is a description. `description:` written as a YAML mapping
+    # used to be coerced with str(dict), so Python repr braces ended up in the
+    # index the model reads; an unusable shape is dropped, never guessed at.
+    raw_description = meta.get("description", "")
+    description = (
+        _one_line(raw_description)[:MAX_DESCRIPTION]
+        if isinstance(raw_description, str)
+        else ""
+    )
     return Skill(
         name=name,
         description=description,

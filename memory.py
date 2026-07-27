@@ -126,9 +126,19 @@ class MemoryStore:
                 f"over its {limit:,} limit. Shorten or remove an entry first — "
                 f"the current contents are:\n\n{self.render(target)}"
             )
-        self.directory.mkdir(parents=True, exist_ok=True)
         path = self.path(target)
-        atomic_write_text(path, payload + "\n" if payload else "")
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, payload + "\n" if payload else "")
+        except OSError as exc:
+            # A raw OSError here would put the absolute host path -- and the
+            # name of whatever is blocking it -- in front of the client. The
+            # store deliberately sits outside the workspace, so that is an
+            # information leak; report the failure without the path.
+            raise MemoryError_(
+                f"Cannot write the {target} store: "
+                f"{exc.strerror or type(exc).__name__}."
+            ) from exc
         with contextlib.suppress(OSError):
             # Memory can hold anything the user told the agent, so it is
             # owner-only on POSIX. Windows already restricts %LOCALAPPDATA%.

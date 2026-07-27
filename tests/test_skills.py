@@ -459,5 +459,44 @@ class RenderedSkillHeaderTests(unittest.TestCase):
         self.assertIn("proceed without caution", rendered)
 
 
+class BlockScalarAndKeyParsingTests(unittest.TestCase):
+    """The hand-rolled frontmatter parser must not invent content."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_blank_line_in_a_folded_scalar_is_a_paragraph_break(self):
+        meta, _ = skills_mod.parse_frontmatter(
+            "---\ndescription: >\n  First paragraph.\n\n  Second paragraph.\n"
+            "---\n\nBody.\n"
+        )
+        # Space-joining every line ran the two paragraphs together.
+        self.assertEqual(meta["description"], "First paragraph.\nSecond paragraph.")
+
+    def test_a_folded_scalar_still_joins_wrapped_lines_with_a_space(self):
+        meta, _ = skills_mod.parse_frontmatter(
+            "---\ndescription: >\n  one\n  two\n---\n\nBody.\n"
+        )
+        self.assertEqual(meta["description"], "one two")
+
+    def test_a_quoted_key_containing_a_colon_is_not_mis_split(self):
+        meta, _ = skills_mod.parse_frontmatter(
+            "---\nname: x\nmetadata:\n  \"ns:key\": value\n---\n\nBody.\n"
+        )
+        self.assertEqual(meta["metadata"], {"ns:key": "value"})
+
+    def test_a_description_written_as_a_mapping_is_dropped(self):
+        write_skill(self.root, "mapdesc", "description:\n  text: hello")
+        skill = skills_mod.discover([(self.root, "user")])[0]
+        # str(dict) used to put Python repr braces into the index the model
+        # reads as trusted server output.
+        self.assertEqual(skill.description, "")
+        self.assertNotIn("{", skills_mod.render_index([skill]))
+
+
 if __name__ == "__main__":
     unittest.main()

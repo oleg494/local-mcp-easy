@@ -83,9 +83,67 @@ New environment variables: `MCP_SKILLS_DIR`, `MCP_MEMORY_DIR`, `MCP_MEMORY`,
 - `launcher.py --doctor` reports how many skills are visible and whether a
   memory store exists.
 
+### Security — hardening of the new surface (pre-release review)
+
+Skills and memory both write into the client's system prompt, and both read from
+locations a `mcp:files:write` client can influence, so the feature went through
+an adversarial review before release. Twelve findings, all fixed here.
+
+- **Arbitrary file read through a junctioned skill directory (high).** A
+  directory junction (`mklink /J` needs no admin rights and is invisible to
+  `Path.is_symlink()`) planted as `<workspace>/.mcp-skills/<name>` made the
+  containment check tautological: `resolve_support_file()` derived the root it
+  compared against from `skill.directory.resolve()` — the attacker's own target
+  — so every file under that tree was readable through
+  `skill_view(name, file_path=...)` with nothing but `mcp:files:read`.
+  Discovery now refuses any entry whose resolved path leaves its configured
+  skills root, each skill remembers that root, and resolution re-checks the
+  directory against the root before it checks the requested path. The walk that
+  lists `references/`, `scripts/` and `assets/` applies the same check, so a
+  junction planted inside a support directory can no longer leak foreign
+  filenames into a listing the model is told it may fetch.
+- **Forged provenance line in a rendered skill (high).** `render_skill()`
+  embedded the raw `description` into a line-oriented header, so a block-scalar
+  description in a workspace skill could add header lines of its own — for
+  example a fake `source:` line claiming the skill was reviewed — exactly where
+  the real trust banner goes. Descriptions are flattened to one line at load
+  time for every consumer, and again at render time.
+- **Forged memory entry via a bare carriage return (high).** The guard that
+  refuses a lone `§` line compared against LF-split text, so `§\r` slipped past
+  it, was stored verbatim, and was translated back into a lone delimiter line by
+  the universal-newline read on the next session — splitting one write into two
+  independently remembered entries in the system prompt. Line endings are
+  normalised before validation, and only the normalised form is stored.
+- **The consent screen understated the file scopes (high).** `skills_list`,
+  `skill_view` and `memory_read` ride on `mcp:files:read`, and `memory_write` on
+  `mcp:files:write` — both default scopes — yet the descriptions said
+  "workspace", while skills and memory deliberately live outside it. Both now
+  state that the scope also reaches installed skills and persistent
+  cross-session memory.
+- **Recalled memory is fenced and labelled (medium).** The memory block was
+  spliced into the instructions unlabelled, so a remembered line read exactly
+  like a standing instruction from the operator. It is now wrapped in
+  `<recalled_memory source="earlier session, unverified">` and preceded by an
+  explicit note that the contents are data, never instructions.
+- **Folded block scalars lost paragraph breaks (medium).** A blank line inside a
+  `>` scalar is a paragraph break in YAML; it collapsed into a double space, so
+  a multi-paragraph description came out as one run-on line.
+- Also fixed: a quoted frontmatter key containing a colon was mis-split by the
+  naive `partition(":")`; a `description:` written as a mapping was coerced with
+  `str(dict)` and put Python repr braces into the index the model reads (an
+  unusable shape is dropped instead); a non-numeric `MCP_MEMORY_CHAR_LIMIT` or
+  `MCP_USER_CHAR_LIMIT` aborted startup with a bare `ValueError` that never
+  named the variable, while `0` or a negative value silently bricked the store
+  by refusing every write as over budget (both are now refused at startup, with
+  the variable named); a failed memory write surfaced the absolute host path of
+  the store to the client; and `memory_write` no longer advertises
+  `idempotentHint`, because `replace` and `remove` raise once they have
+  succeeded, so a client retrying a dropped response would see a failure for a
+  write that went through.
+
 ### Tests
 
-- 370 → 449. Frontmatter parsing (block scalars, nesting, BOM, malformed input),
+- 370 → 469. Frontmatter parsing (block scalars, nesting, BOM, malformed input),
   discovery precedence including the personal-over-workspace rule, all three
   disclosure levels, support-file traversal, index-forgery via a multi-line
   description, memory format and budget boundaries, delimiter injection, and an
