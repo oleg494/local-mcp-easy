@@ -26,9 +26,26 @@ ALL_SCOPES = (
     SCOPE_GIT,
 )
 
+# What the user actually reads on the consent screen, so each line must name
+# everything the scope reaches -- including the stores that deliberately live
+# OUTSIDE the workspace. skills_list/skill_view/memory_read ride on
+# mcp:files:read and memory_write rides on mcp:files:write, and both are in
+# DEFAULT_SCOPES below, i.e. granted to any client that registers without
+# asking for a scope at all. Describing them as workspace-only would make
+# access to persistent cross-session memory silent by default.
 SCOPE_DESCRIPTIONS = {
-    SCOPE_FILES_READ: "Read files and directories inside the workspace",
-    SCOPE_FILES_WRITE: "Create, edit, move and delete files inside the workspace",
+    SCOPE_FILES_READ: (
+        "Read files and directories inside the workspace. Also grants read "
+        "access OUTSIDE the workspace to the agent's installed skills and to "
+        "its persistent cross-session memory, which can hold personal facts "
+        "about you saved in earlier sessions."
+    ),
+    SCOPE_FILES_WRITE: (
+        "Create, edit, move and delete files inside the workspace. Also grants "
+        "write access OUTSIDE the workspace to the agent's persistent "
+        "cross-session memory - adding, rewriting or deleting entries that are "
+        "placed in the system prompt of every later session."
+    ),
     SCOPE_COMMANDS_RUN: (
         "Run allow-listed developer commands. In trusted developer mode these "
         "programs (Python, Git, Node, ...) run with the operating-system user's "

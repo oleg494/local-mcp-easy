@@ -1,5 +1,154 @@
 # Changelog
 
+## 2.5.0 — 2026-07-26 (Agent skills and persistent memory)
+
+Two things an autonomous agent usually has and an MCP server usually does not: a
+library of reusable procedures, and memory that survives the session. Here every
+connected MCP client gets them, not one particular agent.
+
+Both reach the model through the MCP `instructions` field returned at
+`initialize` — the only channel a server has into a client's system prompt.
+Anything else would have to be pulled with a tool call the client must first
+know to make.
+
+### Added — skills
+
+- A skill is a folder holding `SKILL.md`: YAML frontmatter plus markdown
+  instructions. The format is the portable core of the
+  [agentskills.io](https://agentskills.io/specification) spec (`name`,
+  `description`, `license`, `compatibility`, `metadata`) with none of the
+  client-specific extensions, so the same skill also loads in Claude Code.
+- Two locations: `<config>/skills/<name>/SKILL.md` for personal skills available
+  in every workspace, and `<workspace>/.mcp-skills/<name>/SKILL.md` for skills
+  that belong to one project.
+- **Progressive disclosure, three levels**, so a large library stays affordable:
+  1. always — `name: description`, one line per skill, in the server
+     instructions and via `skills_list()`;
+  2. on demand — the `SKILL.md` body, via `skill_view(name)`;
+  3. separately — `references/`, `scripts/` and `assets/` are never inlined even
+     at level 2; the rendered skill ends with a list of them and a
+     `skill_view(name, file_path=...)` pointer.
+- **A skill is instructions the model will follow, so it is a trust boundary,
+  not data.** A personal skill always wins over a workspace skill of the same
+  name — the workspace is writable by any client holding `mcp:files:write`, so
+  the other precedence would be a privilege escalation — and a workspace skill
+  is labelled `[workspace]` everywhere it is rendered. Descriptions are
+  flattened to one line so they cannot forge extra index entries in the system
+  prompt. Nothing here executes: a skill may *tell* the model to run something,
+  which then goes through `run_command` and its allow-list like any other
+  command.
+- The frontmatter parser is hand-rolled (~60 lines) rather than adding PyYAML to
+  a three-dependency project. It handles scalars, quoted values, `>`/`|` block
+  scalars and a one-level `metadata` map, and ignores anything else rather than
+  guessing at it.
+
+### Added — memory
+
+- Two flat files under `<config>/memory/`: `MEMORY.md` for what the agent
+  learned about the environment and the work, `USER.md` for what it learned
+  about the person. Entries are separated by a lone `§` line. No database, no
+  embeddings — recall here means the whole store is put in front of the model,
+  so there is nothing to rank, and an index would add a dependency, a build step
+  and a failure mode to answer a query that is never asked.
+- Budgets are measured in **characters**, not entries (2200 / 1375, both
+  env-overridable). An entry cap would let one rambling entry crowd out ten
+  useful ones; the character cap manages what is actually scarce. An over-budget
+  write is **refused** and hands back the current contents so the model can
+  consolidate and retry — never silently truncated.
+- The store lives outside the workspace, so no filesystem tool can reach it:
+  memory changes only through `memory_write`, where the scope check applies.
+  Files are written atomically and are owner-only (`0600`) on POSIX.
+- An entry containing the delimiter is refused, since it would silently become
+  two entries — a second, unreviewed memory forged by one write. Mutations take
+  a lock: they are read-modify-write of a whole file from `asyncio.to_thread`
+  worker threads, so concurrent writes would otherwise lose one.
+
+### Added — tools
+
+| Tool | Scope |
+| --- | --- |
+| `skills_list()` | `mcp:files:read` |
+| `skill_view(name, file_path="")` | `mcp:files:read` |
+| `memory_read(target="all")` | `mcp:files:read` |
+| `memory_write(action, content, target, old_text)` | `mcp:files:write` |
+
+No new OAuth scopes, deliberately: tokens already issued keep working. Under
+`MCP_READ_ONLY=1`, `memory_write` is simply not registered.
+
+New environment variables: `MCP_SKILLS_DIR`, `MCP_MEMORY_DIR`, `MCP_MEMORY`,
+`MCP_MEMORY_CHAR_LIMIT`, `MCP_USER_CHAR_LIMIT`.
+
+### Changed
+
+- `launcher.py --doctor` reports how many skills are visible and whether a
+  memory store exists.
+
+### Security — hardening of the new surface (pre-release review)
+
+Skills and memory both write into the client's system prompt, and both read from
+locations a `mcp:files:write` client can influence, so the feature went through
+an adversarial review before release. Twelve findings, all fixed here.
+
+- **Arbitrary file read through a junctioned skill directory (high).** A
+  directory junction (`mklink /J` needs no admin rights and is invisible to
+  `Path.is_symlink()`) planted as `<workspace>/.mcp-skills/<name>` made the
+  containment check tautological: `resolve_support_file()` derived the root it
+  compared against from `skill.directory.resolve()` — the attacker's own target
+  — so every file under that tree was readable through
+  `skill_view(name, file_path=...)` with nothing but `mcp:files:read`.
+  Discovery now refuses any entry whose resolved path leaves its configured
+  skills root, each skill remembers that root, and resolution re-checks the
+  directory against the root before it checks the requested path. The walk that
+  lists `references/`, `scripts/` and `assets/` applies the same check, so a
+  junction planted inside a support directory can no longer leak foreign
+  filenames into a listing the model is told it may fetch.
+- **Forged provenance line in a rendered skill (high).** `render_skill()`
+  embedded the raw `description` into a line-oriented header, so a block-scalar
+  description in a workspace skill could add header lines of its own — for
+  example a fake `source:` line claiming the skill was reviewed — exactly where
+  the real trust banner goes. Descriptions are flattened to one line at load
+  time for every consumer, and again at render time.
+- **Forged memory entry via a bare carriage return (high).** The guard that
+  refuses a lone `§` line compared against LF-split text, so `§\r` slipped past
+  it, was stored verbatim, and was translated back into a lone delimiter line by
+  the universal-newline read on the next session — splitting one write into two
+  independently remembered entries in the system prompt. Line endings are
+  normalised before validation, and only the normalised form is stored.
+- **The consent screen understated the file scopes (high).** `skills_list`,
+  `skill_view` and `memory_read` ride on `mcp:files:read`, and `memory_write` on
+  `mcp:files:write` — both default scopes — yet the descriptions said
+  "workspace", while skills and memory deliberately live outside it. Both now
+  state that the scope also reaches installed skills and persistent
+  cross-session memory.
+- **Recalled memory is fenced and labelled (medium).** The memory block was
+  spliced into the instructions unlabelled, so a remembered line read exactly
+  like a standing instruction from the operator. It is now wrapped in
+  `<recalled_memory source="earlier session, unverified">` and preceded by an
+  explicit note that the contents are data, never instructions.
+- **Folded block scalars lost paragraph breaks (medium).** A blank line inside a
+  `>` scalar is a paragraph break in YAML; it collapsed into a double space, so
+  a multi-paragraph description came out as one run-on line.
+- Also fixed: a quoted frontmatter key containing a colon was mis-split by the
+  naive `partition(":")`; a `description:` written as a mapping was coerced with
+  `str(dict)` and put Python repr braces into the index the model reads (an
+  unusable shape is dropped instead); a non-numeric `MCP_MEMORY_CHAR_LIMIT` or
+  `MCP_USER_CHAR_LIMIT` aborted startup with a bare `ValueError` that never
+  named the variable, while `0` or a negative value silently bricked the store
+  by refusing every write as over budget (both are now refused at startup, with
+  the variable named); a failed memory write surfaced the absolute host path of
+  the store to the client; and `memory_write` no longer advertises
+  `idempotentHint`, because `replace` and `remove` raise once they have
+  succeeded, so a client retrying a dropped response would see a failure for a
+  write that went through.
+
+### Tests
+
+- 370 → 469. Frontmatter parsing (block scalars, nesting, BOM, malformed input),
+  discovery precedence including the personal-over-workspace rule, all three
+  disclosure levels, support-file traversal, index-forgery via a multi-line
+  description, memory format and budget boundaries, delimiter injection, and an
+  eight-thread concurrent-write race.
+
 ## 2.4.1 — 2026-07-26 (Process-group kill fix)
 
 - **`_kill_tree` signalled the process group unconditionally.** On POSIX it
